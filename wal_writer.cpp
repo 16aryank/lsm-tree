@@ -1,0 +1,84 @@
+#include "wal_writer.h"
+#include <boost/crc.hpp>
+#include <algorithm>
+#include <system_error>
+#include <unistd.h>
+
+WalWriter::WalWriter(int fd, uint64_t initial_offset)
+    : _fd(fd), _file_offset(initial_offset) {}
+
+void WalWriter::writeAll(const void* buf, size_t n) {
+    const auto* p = static_cast<const uint8_t*>(buf);
+    while (n > 0) {
+        ssize_t r = ::pwrite(_fd, p, n, static_cast<off_t>(_file_offset));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            throw std::system_error(errno, std::generic_category(), "WAL pwrite");
+        }
+        p            += r;
+        _file_offset += static_cast<uint64_t>(r);
+        n            -= static_cast<size_t>(r);
+    }
+}
+
+void WalWriter::padToNextBlock() {
+    const uint32_t tail = kBlockSize - blockOffset();
+    if (tail == 0) return;
+    static constexpr uint8_t zeros[kBlockSize]{};
+    writeAll(zeros, tail);
+    // blockOffset() is now 0 because _file_offset is a multiple of kBlockSize.
+}
+
+void WalWriter::emitFragment(WalRecordType type, std::span<const uint8_t> payload) {
+    boost::crc_32_type crc;
+    crc.process_byte(static_cast<uint8_t>(type));
+    if (!payload.empty())
+        crc.process_bytes(payload.data(), payload.size());
+
+    WriteAheadLogRecord hdr;
+    hdr._crc    = crc.checksum();
+    hdr._length = static_cast<uint16_t>(payload.size());
+    hdr._type   = type;
+
+    writeAll(&hdr, kHeaderSize);
+    if (!payload.empty())
+        writeAll(payload.data(), payload.size());
+}
+
+void WalWriter::addRecord(std::span<const uint8_t> data) {
+    bool           begin   = true;
+    uint32_t       written = 0;
+    const uint32_t total   = static_cast<uint32_t>(data.size());
+
+    do {
+        uint32_t remaining = kBlockSize - blockOffset();
+
+        // Need room for the header plus at least one payload byte (unless the
+        // record itself is empty, in which case kHeaderSize is enough).
+        const bool     has_data  = (total - written > 0);
+        const uint32_t min_room  = kHeaderSize + (has_data ? 1u : 0u);
+        if (remaining < min_room) {
+            padToNextBlock();
+            remaining = kBlockSize;
+        }
+
+        const uint32_t avail    = remaining - kHeaderSize;
+        const uint32_t frag_len = std::min(avail, total - written);
+        const bool     last     = (written + frag_len == total);
+
+        WalRecordType type;
+        if      (begin && last) type = WalRecordType::kFullType;
+        else if (begin)         type = WalRecordType::kFirstType;
+        else if (last)          type = WalRecordType::kLastType;
+        else                    type = WalRecordType::kMiddleType;
+
+        emitFragment(type, data.subspan(written, frag_len));
+        written += frag_len;
+        begin    = false;
+    } while (written < total);
+}
+
+void WalWriter::sync() {
+    if (::fdatasync(_fd) != 0)
+        throw std::system_error(errno, std::generic_category(), "WAL fdatasync");
+}
