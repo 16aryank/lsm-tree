@@ -7,17 +7,18 @@
 #include <unistd.h>
 
 WalReader::WalReader(int fd, uint64_t initial_offset)
-    : _fd(fd), _file_offset(initial_offset) {}
+    : _fd(fd), _file_offset(initial_offset) { }
 
 // ── low-level I/O ─────────────────────────────────────────────────────────────
 
 size_t WalReader::tryRead(void* buf, size_t n) {
     auto* p   = static_cast<uint8_t*>(buf);
-    size_t got = 0;
+    size_t got{ 0 };
     while (got < n) {
         ssize_t r = ::pread(_fd, p + got, n - got, static_cast<off_t>(_file_offset + got));
         if (r < 0) {
-            if (errno == EINTR) continue;
+            // Signal was delivered to the thread while reading, no bytes are read
+            if (errno == EINTR) { continue; }
             throw std::system_error(errno, std::generic_category(), "WAL pread");
         }
         if (r == 0) break; // EOF
@@ -60,9 +61,9 @@ bool WalReader::readFragment(WalRecordType& out_type, std::vector<uint8_t>& out_
         if (got == 0) return false; // clean EOF between records
         if (got < kHeaderSize) throw std::runtime_error("WAL: truncated header");
 
-        // Type == 0 is not a valid WalRecordType; the writer uses it as a
+        // WalRecordType::kPadding is not a valid type; the writer uses it as a
         // sentinel when it pads exactly kHeaderSize bytes at a block boundary.
-        if (static_cast<uint8_t>(hdr._type) == 0) {
+        if (hdr._type == WalRecordType::kPadding) {
             // We consumed kHeaderSize bytes; skip whatever's left in this block.
             skipBytes(kBlockSize - blockOffset());
             continue;
@@ -70,8 +71,7 @@ bool WalReader::readFragment(WalRecordType& out_type, std::vector<uint8_t>& out_
 
         // Read payload.
         out_payload.resize(hdr._length);
-        if (hdr._length > 0)
-            readAll(out_payload.data(), hdr._length);
+        if (hdr._length > 0) { readAll(out_payload.data(), hdr._length); }
 
         // Verify CRC over [type byte | payload bytes].
         boost::crc_32_type crc;
@@ -98,7 +98,7 @@ std::optional<std::vector<uint8_t>> WalReader::readRecord() {
         if (!readFragment(type, fragment)) {
             if (in_fragment)
                 throw std::runtime_error("WAL: incomplete record at EOF");
-            return std::nullopt;
+            return std::nullopt; // EOF
         }
 
         switch (type) {
@@ -108,8 +108,8 @@ std::optional<std::vector<uint8_t>> WalReader::readRecord() {
 
             case WalRecordType::kFirstType:
                 if (in_fragment) throw std::runtime_error("WAL: kFirstType inside fragment sequence");
-                scratch      = std::move(fragment);
-                in_fragment  = true;
+                scratch = std::move(fragment);
+                in_fragment = true;
                 break;
 
             case WalRecordType::kMiddleType:

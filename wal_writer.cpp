@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <system_error>
 #include <unistd.h>
+#include <cassert>
 
 WalWriter::WalWriter(int fd, uint64_t initial_offset)
     : _fd(fd), _file_offset(initial_offset) {}
@@ -12,21 +13,23 @@ void WalWriter::writeAll(const void* buf, size_t n) {
     while (n > 0) {
         ssize_t r = ::pwrite(_fd, p, n, static_cast<off_t>(_file_offset));
         if (r < 0) {
-            if (errno == EINTR) continue;
+            // Signal was delivered to the thread while written, no bytes are written
+            if (errno == EINTR) { continue; }
             throw std::system_error(errno, std::generic_category(), "WAL pwrite");
         }
-        p            += r;
+        p += r;
         _file_offset += static_cast<uint64_t>(r);
-        n            -= static_cast<size_t>(r);
+        n -= static_cast<size_t>(r);
     }
 }
 
 void WalWriter::padToNextBlock() {
     const uint32_t tail = kBlockSize - blockOffset();
     if (tail == 0) return;
-    static constexpr uint8_t zeros[kBlockSize]{};
+    static constexpr uint8_t zeros[kBlockSize]{ };
     writeAll(zeros, tail);
     // blockOffset() is now 0 because _file_offset is a multiple of kBlockSize.
+    assert(blockOffset() == 0);
 }
 
 void WalWriter::emitFragment(WalRecordType type, std::span<const uint8_t> payload) {
@@ -66,11 +69,10 @@ void WalWriter::addRecord(std::span<const uint8_t> data) {
         const uint32_t frag_len = std::min(avail, total - written);
         const bool     last     = (written + frag_len == total);
 
-        WalRecordType type;
-        if      (begin && last) type = WalRecordType::kFullType;
-        else if (begin)         type = WalRecordType::kFirstType;
-        else if (last)          type = WalRecordType::kLastType;
-        else                    type = WalRecordType::kMiddleType;
+        WalRecordType type =    begin && last   ?   WalRecordType::kFirstType :
+                                begin           ?   WalRecordType::kFirstType :
+                                last            ?   WalRecordType::kLastType  :
+                                                    WalRecordType::kMiddleType;
 
         emitFragment(type, data.subspan(written, frag_len));
         written += frag_len;
@@ -79,6 +81,7 @@ void WalWriter::addRecord(std::span<const uint8_t> data) {
 }
 
 void WalWriter::sync() {
+    // Writes the modified file and critical metadata to secure storage
     if (::fdatasync(_fd) != 0)
         throw std::system_error(errno, std::generic_category(), "WAL fdatasync");
 }

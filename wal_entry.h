@@ -4,6 +4,7 @@
 #include "key.h"
 
 enum class WalRecordType : uint8_t {
+    kPadding    = 0, // sentinel when writer pads kHeaderSize bytes at a block boundary
     kFullType   = 1, // entire record fits in one fragment
     kFirstType  = 2, // first fragment of a multi-block record
     kMiddleType = 3, // interior fragment(s)
