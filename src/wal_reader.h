@@ -11,7 +11,6 @@ public:
     // Reads and reassembles the next complete logical record from the WAL.
     // Returns constructed record if partial. Returns std::nullopt on clean EOF.
     // Throws std::system_error on I/O failure, std::runtime_error on corruption.
-    // TO DO: Maybe change this to use a std::expected instead
     std::optional<std::vector<uint8_t>> readRecord();
 
     // Returns the current file offset
@@ -42,6 +41,6 @@ private:
         return static_cast<uint32_t>(_file_offset % kBlockSize);
     }
 
-    int      _fd;
+    int _fd;
     uint64_t _file_offset;
 };

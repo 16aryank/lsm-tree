@@ -91,7 +91,7 @@ bool WalReader::readFragment(WalRecordType& out_type, std::vector<uint8_t>& out_
 std::optional<std::vector<uint8_t>> WalReader::readRecord() {
     std::vector<uint8_t> scratch;
     std::vector<uint8_t> fragment;
-    WalRecordType        type{};
+    WalRecordType        type{ };
     bool                 in_fragment = false;
 
     while (true) {
