@@ -14,7 +14,7 @@ public:
     std::optional<std::vector<uint8_t>> readRecord();
 
     // Returns the current file offset
-    inline uint64_t fileOffset() const noexcept { return _file_offset; }
+    [[nodiscard]] inline uint64_t fileOffset() const noexcept { return _file_offset; }
 
 private:
     // Reads one physical fragment into out_type and out_payload.

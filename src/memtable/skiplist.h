@@ -18,7 +18,7 @@ class SkipList {
 public:
     explicit SkipList(size_t maximum_level = 12);
 
-    std::optional<Value_> search(const Key_& key) const;
+    [[nodiscard]] std::optional<Value_> search(const Key_& key) const;
     void insert(Key_ key, Value_ value);
     void remove(const Key_& key);
 
@@ -26,14 +26,13 @@ private:
     struct Node {
         // nullopt only for the head sentinel, which holds no key/value.
         std::optional<Key_> key;
-        // Heap-allocated so copying/sharing a node never copies expensive values.
         std::shared_ptr<Value_> value;
-        // forward[i] is the next node at level i; shared_ptr gives free, cycle-safe
-        // cleanup since the list is a forward-only DAG.
+    
+        // forward[i] is the next node at level i
         std::vector<std::shared_ptr<Node>> forward;
 
         // Sentinel constructor.
-        explicit Node(size_t level) : key(std::nullopt), value(nullptr), forward(level) {}
+        explicit Node(size_t level) : key(std::nullopt), value(nullptr), forward(level) { }
 
         Node(Key_ k, Value_ v, size_t level)
             : key(std::move(k)),
@@ -42,21 +41,26 @@ private:
     };
 
     // Returns a level in [1, _maximum_level] via repeated coin flips.
-    size_t randomLevel() const;
+    // Increments the level if heads, stops if tails.
+    [[nodiscard]] size_t randomLevel() const;
 
     // Fills update[i] with the last node at level i whose key precedes `key`.
     std::vector<std::shared_ptr<Node>> findPredecessors(const Key_& key) const;
 
     size_t _maximum_level;
+    
+    // Number of levels in the skiplist
     size_t _level = 1;
     std::shared_ptr<Node> _head;
+
+    // Declared mutable because randomLevel() is const.
     mutable std::mt19937 _rng{ std::random_device{}() };
     mutable std::bernoulli_distribution _coin{0.5};
 };
 
 template <Orderable Key_, typename Value_>
 SkipList<Key_, Value_>::SkipList(size_t maximum_level)
-    : _maximum_level(maximum_level), _head(std::make_shared<Node>(maximum_level)) {}
+    : _maximum_level(maximum_level), _head(std::make_shared<Node>(maximum_level)) { }
 
 template <Orderable Key_, typename Value_>
 size_t SkipList<Key_, Value_>::randomLevel() const {

@@ -1,6 +1,6 @@
 // Basic insertions, removal, and search tests for skiplist
 
-#include "src/skiplist.h"
+#include "src/memtable/skiplist.h"
 #include <string>
 #include <cassert>
 
