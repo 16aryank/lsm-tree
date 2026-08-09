@@ -4,6 +4,7 @@
 #include <system_error>
 #include <unistd.h>
 #include <cassert>
+#include <fcntl.h>
 
 WalWriter::WalWriter(int fd, uint64_t initial_offset)
     : _fd(fd), _file_offset(initial_offset) {}
@@ -81,7 +82,24 @@ void WalWriter::addRecord(std::span<const uint8_t> data) {
 }
 
 void WalWriter::sync() {
-    // Writes the modified file and critical metadata to secure storage
-    if (::fdatasync(_fd) != 0)
+    // Writes the modified file and critical metadata to secure storage.
+
+    // MacOS does not support fdatasync(), use fsync().
+    // Default to fdataasync because we do not need to store
+    // metadata about file size or access time.
+
+    // fsync() does is not truly equivalent to fdataasync()
+    // because it only pushes data from the kernel to disk, not
+    // the drive's hardware cache to physical storage.
+    // This is fine because we're only concerned with application
+    // crashes, and fcntl() is very slow.
+    auto write_file = 
+#ifdef __APPLE__ && defined(__MACH__)
+    fsync(_fd);
+#else
+    ::fdataasync(_fd)
+#endif
+
+    if (write_file != 0)
         throw std::system_error(errno, std::generic_category(), "WAL fdatasync");
 }
