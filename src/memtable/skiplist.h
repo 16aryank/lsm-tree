@@ -27,7 +27,7 @@ private:
         // nullopt only for the head sentinel, which holds no key/value.
         std::optional<Key_> key;
         std::shared_ptr<Value_> value;
-    
+
         // forward[i] is the next node at level i
         std::vector<std::shared_ptr<Node>> forward;
 
@@ -40,6 +40,34 @@ private:
               forward(level) {}
     };
 
+public:
+    // Forward-only, read-only cursor over the level-0 chain, in ascending
+    // key order. Default-constructed iterators are invalid (end).
+    class Iterator {
+    public:
+        Iterator() = default;
+
+        [[nodiscard]] bool valid() const noexcept { return _node != nullptr; }
+        void next() { _node = _node->forward[0]; }
+
+        [[nodiscard]] const Key_& key() const { return *_node->key; }
+        [[nodiscard]] const Value_& value() const { return *_node->value; }
+
+    private:
+        friend class SkipList;
+        explicit Iterator(std::shared_ptr<Node> node) : _node(std::move(node)) { }
+
+        std::shared_ptr<Node> _node;
+    };
+
+    // Returns an iterator positioned at the smallest key.
+    [[nodiscard]] Iterator begin() const;
+
+    // Returns an iterator positioned at the first node whose key is >= key
+    // (i.e. lower_bound). Invalid if no such node exists.
+    [[nodiscard]] Iterator seek(const Key_& key) const;
+
+private:
     // Returns a level in [1, _maximum_level] via repeated coin flips.
     // Increments the level if heads, stops if tails.
     [[nodiscard]] size_t randomLevel() const;
@@ -98,6 +126,22 @@ std::optional<Value_> SkipList<Key_, Value_>::search(const Key_& key) const {
         return *cur->value;
     }
     return std::nullopt;
+}
+
+template <Orderable Key_, typename Value_>
+typename SkipList<Key_, Value_>::Iterator SkipList<Key_, Value_>::begin() const {
+    return Iterator(_head->forward[0]);
+}
+
+template <Orderable Key_, typename Value_>
+typename SkipList<Key_, Value_>::Iterator SkipList<Key_, Value_>::seek(const Key_& key) const {
+    std::shared_ptr<Node> cur = _head;
+    for (size_t i = _level; i-- > 0;) {
+        while (cur->forward[i] && cur->forward[i]->key < key) {
+            cur = cur->forward[i];
+        }
+    }
+    return Iterator{ cur->forward[0] };
 }
 
 template <Orderable Key_, typename Value_>

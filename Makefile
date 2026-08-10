@@ -1,6 +1,7 @@
 CXX      := g++
 CXXFLAGS := -std=c++23 -Wall -Wextra -g
 INCLUDES := -I. -Isrc -I/opt/homebrew/opt/boost/include
+LDFLAGS  := -L/opt/homebrew/opt/boost/lib -lboost_thread
 
 SRC_DIR   := src
 TEST_DIR  := tests
@@ -43,7 +44,7 @@ $(BUILD_DIR)/%.o: $(TEST_DIR)/%.cpp
 .SECONDEXPANSION:
 $(BIN_DIR)/%: $(BUILD_DIR)/%.o $$(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$$(wildcard $(SRC_DIR)/$$(dir %)*.cpp))
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $^ -o $@
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Build and run every test, e.g. `make test`.
 test: $(TEST_BINS)

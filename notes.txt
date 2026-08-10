@@ -1,10 +1,5 @@
-random notes that will eventually be synchronized
-
-
-sync doesn't offer true durability for SSDs bc of 
-    // Flushes written data to stable storage.
-    // On macOS, prefer fcntl(fd, F_FULLFSYNC) for true durability on SSDs.
-    void sync();
+need to compact the WAL entries after they are successfully flushed
+should have one background thread doing that
 
 
 commit message format

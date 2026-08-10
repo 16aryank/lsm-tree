@@ -101,5 +101,5 @@ void WalWriter::sync() {
 #endif
 
     if (write_file != 0)
-        throw std::system_error(errno, std::generic_category(), "WAL fdatasync");
+        throw std::system_error(errno, std::generic_category(), "WAL sync");
 }
