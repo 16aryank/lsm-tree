@@ -11,20 +11,15 @@
 #include "memtable/memtable.h"
 #include "wal/wal_writer.h"
 
-// SSTable does not exist yet -- flushToSSTable() below is an intentional
-// stub. Only a raw pointer to this incomplete type is ever used, so nothing
-// here requires SSTable to be defined.
+// SSTable does not exist yet
 class SSTable;
 
 // Owns the "live" write path for one column of an LSM engine: a mutable
 // MemTable that absorbs new writes, and (at most) one immutable MemTable
 // that a background thread is flushing to a Level-0 SSTable.
 
-//   Thread-safety: the pointer swap in promote() and the pointer reads in add()/get()
-//   go through the same boost::shared_mutex: reads take the shared lock,
-//   promotion takes the exclusive lock, making promotion atomic with
-//   respect to concurrent readers. The exclusive lock is held only for the swap itself,
-//   not for the flush I/O that follows
+// Thread-safety: promote() takes exclusive lock, add()/get() take shared
+// lock, and the I/O flush during promote() does not hold a lock
 template <typename UserKey_, typename Value_>
 class MemTableManager {
 public:
@@ -32,9 +27,6 @@ public:
     using MemTableFactory = std::function<MemTablePtr()>;
     using WalFactory = std::function<std::shared_ptr<WalWriter>()>;
 
-    // wal_factory is optional: when supplied, it is invoked once at
-    // construction and again on every promotion to obtain a fresh WAL to
-    // pair with the fresh mutable MemTable, as currentWal().
     explicit MemTableManager(size_t size_threshold_bytes = kDefaultMemTableSizeBytes,
                               WalFactory wal_factory = nullptr)
         : _size_threshold_bytes(size_threshold_bytes),
@@ -57,9 +49,6 @@ public:
     MemTableManager(const MemTableManager&) = delete;
     MemTableManager& operator=(const MemTableManager&) = delete;
 
-    // Writes to the current mutable MemTable, promoting it to immutable
-    // (and starting a background flush) if this write tips it over the
-    // size threshold.
     void add(uint64_t seq, ValueType type, const UserKey_& key, Value_ value) {
         MemTablePtr target;
         {
@@ -136,7 +125,7 @@ private:
         }
 
         // Don't hold lock during the flush process for increased concurrency
-        // Need to have some sort of safegaurds against write failures / impelment retries
+        // TODO: Need to have some sort of safegaurds against write failures / impelment retries
 
         if (_flush_thread.joinable()) {
             _flush_thread.join();

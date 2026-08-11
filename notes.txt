@@ -1,6 +1,14 @@
 need to compact the WAL entries after they are successfully flushed
 should have one background thread doing that
 
+need to maintain safety if writing to the wal fails
+need to impelment recovery -- walking back and reading the wal
+
+need to add many many many more tests:
+- switch to using Google test
+- in the WAL:
+    - 
+
 
 commit message format
 
