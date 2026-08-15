@@ -16,7 +16,7 @@ class SSTable;
 
 // Owns the "live" write path for one column of an LSM engine: a mutable
 // MemTable that absorbs new writes, and (at most) one immutable MemTable
-// that a background thread is flushing to a Level-0 SSTable.
+// that a background thread is flushifng to a Level-0 SSTable.
 
 // Thread-safety: promote() takes exclusive lock, add()/get() take shared
 // lock, and the I/O flush during promote() does not hold a lock

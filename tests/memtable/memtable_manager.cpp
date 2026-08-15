@@ -5,7 +5,7 @@
 #include <string>
 
 int main() {
-    MemTableManager<std::string, std::string> mgr(64); // tiny threshold to force promotion quickly
+    MemTableManager<std::string, std::string> mgr(256);
 
     mgr.add(1, ValueType::kValue, "a", "small");
     assert(!mgr.hasPendingFlush());

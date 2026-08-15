@@ -1,170 +1,125 @@
 #pragma once
-#include <atomic>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
-#include <type_traits>
+#include <string_view>
 #include <boost/thread/locks.hpp>
 #include <boost/thread/shared_mutex.hpp>
 
 #include "key.h"
+#include "memtable/arena.h"
 #include "memtable/skiplist.h"
 
 inline constexpr size_t kDefaultMemTableSizeBytes = 4ull << 20; // 4 MB
 
-// Orders by user key ascending, then by (sequence number, type) descending
-template <typename UserKey_>
-struct InternalKey {
-    Key<UserKey_> tagged_key;
-
-    bool operator<(const InternalKey& other) const
-        requires requires(const UserKey_& a, const UserKey_& b) {
-            { a < b } -> std::convertible_to<bool>;
-        }
-    {
-        const UserKey_& a = tagged_key._user_key;
-        const UserKey_& b = other.tagged_key._user_key;
-        if (a < b) return true;
-        if (b < a) return false;
-        return tagged_key._seqnum_type > other.tagged_key._seqnum_type;
-    }
-
-    bool operator==(const InternalKey& other) const
-        requires requires(const UserKey_& a, const UserKey_& b) {
-            { a == b } -> std::convertible_to<bool>;
-        }
-    {
-        return tagged_key._seqnum_type == other.tagged_key._seqnum_type &&
-               tagged_key._user_key == other.tagged_key._user_key;
-    }
-};
-
-// Substituted for InternalKey<UserKey_> as the skip list's key type when
-// UserKey_ does not satisfy Orderable. This keeps SkipList<TableKey, Value_>
-// and therefore MemTable<UserKey_, Value_> itself always a valid
-// instantiation, so construction fails with a catchable std::invalid_argument
-// from the MemTable constructor rather than a compile error.
-struct UnorderableKeyPlaceholder {
-    bool operator<(const UnorderableKeyPlaceholder&) const { return false; }
-    bool operator==(const UnorderableKeyPlaceholder&) const { return true; }
-};
-
-namespace memtable_detail {
-
-// Best-effort byte-size estimate for the memtable's size accounting.
-// Falls back to sizeof(T) for fixed-size/POD-ish types; uses .size() for
-// container-like types since sizeof() only reports the control-block size.
+// A memtable can store a contiguous run of bytes it can copy into its
+// arena. Satisfied by std::string, std::string_view, std::vector<char>.
 template <typename T>
-size_t approxByteSize(const T& value) {
-    if constexpr (requires { { value.size() } -> std::convertible_to<size_t>; }) {
-        return static_cast<size_t>(value.size());
-    } else {
-        return sizeof(T);
-    }
-}
+concept ByteRange = requires(const T& value) {
+    { value.data() } -> std::convertible_to<const char*>;
+    { value.size() } -> std::convertible_to<size_t>;
+};
 
-// SkipList uses p=0.5 for level promotion; a node's expected number of forward pointers is 1/(1-p) = 2.
-inline constexpr size_t kExpectedForwardLevels = 2;
+// Values have to be rebuildable from those bytes on the way back
+// out, since get() hands the caller an owning Value_ rather than a view into
+// the arena.
+template <typename T>
+concept ByteStorable = ByteRange<T> && std::constructible_from<T, const char*, size_t>;
 
-// Per-entry bookkeeping the skip list adds on top of the raw key/value
-// bytes, derived from SkipList::Node's layout:
-//   - the std::shared_ptr<Value_> handle stored inline in Node
-//   - std::vector<shared_ptr<Node>> forward's inline {begin,end,cap} control
-//     block
-//   - forward's heap-allocated backing array, sized to the node's expected
-//     level (kExpectedForwardLevels shared_ptr<Node> slots)
-//   - the two heap allocations' control blocks from make_shared<Node> and
-//     make_shared<Value_> (refcounts + deleter, ~2 pointers each)
-
-// TODO: This will be changed to use a memory allocator in the skiplist instead
-// of pointers since the memory overhead is too high. Typical workloads have ~10-20 byte
-// keys and ~100 byte values, making the bookkeeping ~50% of the memory footprint. 
-inline constexpr size_t kEntryOverheadBytes =
-    sizeof(std::shared_ptr<void>) +
-    sizeof(std::vector<std::shared_ptr<void>>) +
-    kExpectedForwardLevels * sizeof(std::shared_ptr<void>) +
-    2 * (2 * sizeof(void*));
-
-} // namespace memtable_detail
-
-// An in-memory table of versioned key/value entries backed by a SkipList.
+// Entries are copied into an Arena as raw bytes, one allocation per entry,
+// with the key and value stored inline in the node. Nothing is freed
+// individually -- the arena releases everything at once when the table is
+// destroyed after its flush.
+//
 // Thread-safety: guarded internally by a boost::shared_mutex. add() takes the
-// exclusive lock; get() and newIterator() take the shared lock
+// exclusive lock; get() and newIterator() take the shared lock.
 template <typename UserKey_, typename Value_>
 class MemTable {
 private:
-    using VersionedKey = InternalKey<UserKey_>;
-    using TableKey = std::conditional_t<Orderable<VersionedKey>, VersionedKey, UnorderableKeyPlaceholder>;
-    using Table = SkipList<TableKey, Value_>;
+    using Table = SkipList<>;
+
+    static std::string_view bytesOf(const ByteRange auto& value) noexcept {
+        return { value.data(), value.size() };
+    }
 
 public:
-    // Forward-only cursor over all versions of all keys, in InternalKey
+    // Forward-only cursor over all versions of all keys, in internal-key
     // order (user key ascending, newest version of each key first).
+    //
+    // key() and value() are views into the arena, valid only while the
+    // MemTable that produced this iterator is alive.
     class Iterator {
     public:
         [[nodiscard]] bool valid() const noexcept { return _it.valid(); }
         void next() { _it.next(); }
 
-        [[nodiscard]] const UserKey_& key() const { return _it.key().tagged_key._user_key; }
-        [[nodiscard]] uint64_t sequenceNumber() const { return unpackSeqNumber(_it.key().tagged_key._seqnum_type); }
-        [[nodiscard]] ValueType valueType() const { return unpackValueType(_it.key().tagged_key._seqnum_type); }
-        [[nodiscard]] const Value_& value() const { return _it.value(); }
+        [[nodiscard]] std::string_view key() const noexcept { return _it.key(); }
+        [[nodiscard]] uint64_t sequenceNumber() const noexcept { return unpackSeqNumber(_it.tag()); }
+        [[nodiscard]] ValueType valueType() const noexcept { return unpackValueType(_it.tag()); }
+        [[nodiscard]] std::string_view value() const noexcept { return _it.value(); }
 
     private:
         friend class MemTable;
-        explicit Iterator(typename Table::Iterator it) : _it(std::move(it)) {}
+        explicit Iterator(typename Table::Iterator it) noexcept : _it(it) { }
 
         typename Table::Iterator _it;
     };
 
     explicit MemTable(size_t size_threshold_bytes = kDefaultMemTableSizeBytes)
-        : _size_threshold_bytes(size_threshold_bytes) {
-        if constexpr (!Orderable<VersionedKey>) {
+        : _size_threshold_bytes(size_threshold_bytes), _table(_arena)
+        {
+        if constexpr (!ByteRange<UserKey_>) {
             throw std::invalid_argument(
-                "MemTable: key type does not satisfy the Orderable concept required by the underlying SkipList");
+                "MemTable: key type does not satisfy the ByteRange concept required by the underlying SkipList");
         }
+        _base_bytes = _arena.bytesAllocated();
     }
 
     // Records a versioned write. type == ValueType::kDelete stores a
-    // tombstone for `key`; the accompanying value is ignored by get() but still stored.
+    // tombstone for `key`; the accompanying value is ignored by get() but
+    // still stored. Both key and value are copied into the arena.
     void add(uint64_t seq, ValueType type, const UserKey_& key, Value_ value) {
         boost::unique_lock<boost::shared_mutex> lock(_mutex);
-        TableKey internal_key{ Key<UserKey_>{ key, packSeqAndType(seq, type) } };
-        _approx_size_bytes.fetch_add(
-            memtable_detail::approxByteSize(key) + 
-                memtable_detail::approxByteSize(value) +
-                memtable_detail::kEntryOverheadBytes,
-            std::memory_order_relaxed
-        );
-        _table.insert(internal_key, std::move(value));
+        _table.insert(bytesOf(key), packSeqAndType(seq, type), bytesOf(value));
     }
 
     // Returns the value with the largest sequence number <= seq for key, or
-    // std::nullopt not found or newest is a tombstone.
-    [[nodiscard]] std::optional<Value_> get(const UserKey_& key, uint64_t seq) const {
+    // std::nullopt if not found or the newest is a tombstone.
+    [[nodiscard]] std::optional<Value_> get(const UserKey_& key, uint64_t seq) const
+        requires ByteStorable<Value_>
+    {
         boost::shared_lock<boost::shared_mutex> lock(_mutex);
-        TableKey lookup{ Key<UserKey_>{ key, packSeqAndType(seq, ValueType::kValue) } };
-        typename Table::Iterator it = _table.seek(lookup);
-        if (!it.valid() || it.key().tagged_key._user_key != key) {
+        const std::string_view key_bytes = bytesOf(key);
+
+        // Tags sort descending within a key, so lower_bound on
+        // (key, seq|kValue) lands on the newest version at or below seq.
+        typename Table::Iterator it = _table.seek(key_bytes, packSeqAndType(seq, ValueType::kValue));
+        if (!it.valid() || it.key() != key_bytes) {
             return std::nullopt;
         }
-        if (unpackValueType(it.key().tagged_key._seqnum_type) == ValueType::kDelete) {
+        if (unpackValueType(it.tag()) == ValueType::kDelete) {
             return std::nullopt;
         }
-        return it.value();
+        const std::string_view value_bytes = it.value();
+        return Value_(value_bytes.data(), value_bytes.size());
     }
 
-    // Caller owns the returned Iterator.
+    // Caller owns the returned Iterator, which must not outlive this MemTable.
     [[nodiscard]] Iterator* newIterator() const {
         boost::shared_lock<boost::shared_mutex> lock(_mutex);
         return new Iterator(_table.begin());
     }
 
+    // Exact count of entry bytes handed out by the arena, excluding the skip
+    // list's head sentinel. Every byte an entry costs comes from one 
+    // arena allocation, so this accurate.
     [[nodiscard]] size_t approximateMemoryUsage() const noexcept {
-        return _approx_size_bytes.load(std::memory_order_relaxed);
+        return _arena.bytesAllocated() - _base_bytes;
     }
+
+    [[nodiscard]] size_t arenaMemoryUsage() const noexcept { return _arena.bytesReserved(); }
 
     [[nodiscard]] bool shouldFlush() const noexcept {
         return approximateMemoryUsage() >= _size_threshold_bytes;
@@ -172,7 +127,12 @@ public:
 
 private:
     mutable boost::shared_mutex _mutex;
-    std::atomic<size_t> _approx_size_bytes{ 0 };
     size_t _size_threshold_bytes;
+
+    // Declared before _table: the skip list holds a reference to this arena
+    // and allocates its head sentinel from it during construction.
+    Arena _arena;
     Table _table;
+
+    size_t _base_bytes{ 0 };
 };
