@@ -67,9 +67,14 @@ $(TEST_BUILD)/%.o: $(TEST_DIR)/%.cpp
 # doesn't block tests that don't need it. Generated per test rather than done
 # with one pattern rule, because the src-object list depends on the test's own
 # subdirectory and `%` isn't available inside a secondary expansion.
+#
+# A test covering a unit that spans directories names the extra ones here;
+# anything unlisted still links its own subdirectory alone.
+SRC_DIRS_memtable/memtable_manager := memtable/ sstable/
+
 define TEST_LINK_RULE
 $(BIN_DIR)/$(1): $(TEST_BUILD)/$(1).o \
-                 $(patsubst $(SRC_DIR)/%.cpp,$(SRC_BUILD)/%.o,$(wildcard $(SRC_DIR)/$(dir $(1))*.cpp))
+                 $(patsubst $(SRC_DIR)/%.cpp,$(SRC_BUILD)/%.o,$(foreach d,$(or $(SRC_DIRS_$(1)),$(dir $(1))),$(wildcard $(SRC_DIR)/$(d)*.cpp)))
 	@mkdir -p $$(dir $$@)
 	$$(CXX) $$(CXXFLAGS) $$^ -o $$@ $$(LDFLAGS)
 endef

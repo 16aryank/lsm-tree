@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <bit>
+#include <string_view>
 
 // Stored in the low 8 bits of the packed seqnum_type uint64_t.
 // kDelete < kValue so deletions sort before insertions at equal seqnum.
@@ -28,3 +29,18 @@ inline constexpr uint64_t unpackSeqNumber(uint64_t seqnum_type) noexcept {
 inline constexpr ValueType unpackValueType(uint64_t seqnum_type) noexcept {
     return static_cast<ValueType>(seqnum_type & 0xFF);
 }
+
+// Orders entries the way an LSM needs: user key ascending by byte value, then
+// tag (the packed seqnum|type) descending, so the newest version of a key is
+// the first one a seek lands on.
+struct InternalKeyComparator {
+    int operator()(std::string_view a_key, uint64_t a_tag,
+                   std::string_view b_key, uint64_t b_tag) const noexcept {
+        if (const int c = a_key.compare(b_key); c != 0) {
+            return c;
+        }
+        if (a_tag > b_tag) return -1;
+        if (a_tag < b_tag) return 1;
+        return 0;
+    }
+};

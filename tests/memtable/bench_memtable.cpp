@@ -13,10 +13,6 @@
 //
 // It is deliberately excluded from `make` and `make test`.
 //
-// This translation unit exists to exercise the deprecated implementation, so
-// the deprecation warnings it would otherwise emit on every call are turned
-// off for the whole file.
-
 // ------Results-------------------------------------------------------------
 // Head-to-head at 1M entries (-O2)
 

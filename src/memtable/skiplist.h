@@ -1,4 +1,5 @@
 #pragma once
+#include "key.h"
 #include "memtable/arena.h"
 
 #include <cassert>
@@ -13,24 +14,6 @@
 // uses, which is what keeps insert() free of per-operation heap allocation.
 inline constexpr size_t kMaxSkipListLevel     = 16;
 inline constexpr size_t kDefaultSkipListLevel = 12;
-
-// Orders entries the way an LSM memtable needs: user key ascending by byte
-// value, then tag (the packed seqnum|type) descending, so the newest version
-// of a key is the first one seek() lands on.
-//
-// Byte ordering matches std::string's operator< -- char_traits<char>::compare
-// has unsigned-byte semantics -- so string keys sort exactly as before.
-struct InternalKeyComparator {
-    int operator()(std::string_view a_key, uint64_t a_tag,
-                   std::string_view b_key, uint64_t b_tag) const noexcept {
-        if (const int c = a_key.compare(b_key); c != 0) {
-            return c;
-        }
-        if (a_tag > b_tag) return -1;
-        if (a_tag < b_tag) return 1;
-        return 0;
-    }
-};
 
 // An ordered map of byte-string keys to byte-string values, stored entirely in
 // an Arena.
