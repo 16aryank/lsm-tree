@@ -14,9 +14,6 @@ public:
     explicit SSTableIterator(std::shared_ptr<const SSTable> table)
         : _table(std::move(table)), _it(_table->cursor()) { }
 
-    SSTableIterator(const SSTableIterator&) = delete;
-    SSTableIterator& operator=(const SSTableIterator&) = delete;
-
     [[nodiscard]] bool valid() const noexcept override { return _it.valid(); }
     void next() override { _it.next(); }
 

@@ -49,6 +49,13 @@ public:
     // invalidated by next(). The SSTable must outlive the iterator.
     class Iterator {
     public:
+        // Non-copyable: _current holds views into _buffer, so a copy would keep
+        // pointing at the source's block and dangle the moment that source
+        // died. Nothing needs to copy a forward-only cursor, and cursor()
+        // returns a prvalue, so this costs no caller anything.
+        Iterator(const Iterator&) = delete;
+        Iterator& operator=(const Iterator&) = delete;
+
         [[nodiscard]] bool valid() const noexcept { return _valid; }
         void next();
 
