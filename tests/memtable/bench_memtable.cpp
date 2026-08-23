@@ -220,12 +220,11 @@ int main(int argc, char** argv) {
         "arena", entries,
         [](auto& table, uint64_t& bytes) {
             size_t count = 0;
-            auto* it = table.newIterator();
-            for (; it->valid(); it->next()) {
-                bytes += it->value().size();
+            auto it = table.cursor();
+            for (; it.valid(); it.next()) {
+                bytes += it.value().size();
                 ++count;
             }
-            delete it;
             return count;
         });
 

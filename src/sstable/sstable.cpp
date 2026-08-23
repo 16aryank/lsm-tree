@@ -125,6 +125,7 @@ void SSTable::loadIndex() {
         return;
     }
     _largest_key = _index.back().key;
+    _largest_tag = _index.back().tag;
 
     // The smallest key is the first entry of the first block; one extra read
     // at open time, and the bound is wanted for every overlap check later.
@@ -133,6 +134,7 @@ void SSTable::loadIndex() {
         corrupt(_path, "truncated first data block");
     }
     _smallest_key.assign(entry.key);
+    _smallest_tag = entry.tag;
 }
 
 std::optional<SSTable::Entry> SSTable::get(std::string_view key, uint64_t seq) const {
@@ -182,7 +184,7 @@ SSTable::Iterator::Iterator(const SSTable* table) : _table(table) {
 
 void SSTable::Iterator::loadBlock(size_t index) {
     for (size_t block = index; block < _table->_index.size(); ++block) {
-        _buffer      = _table->readBlock(_table->_index[block].handle);
+        _buffer = _table->readBlock(_table->_index[block].handle);
         _block_index = block;
 
         const size_t next = decodeEntry(_buffer, 0, _current);
@@ -196,7 +198,7 @@ void SSTable::Iterator::loadBlock(size_t index) {
     }
     _buffer.clear();
     _current = { };
-    _valid   = false;
+    _valid = false;
 }
 
 void SSTable::Iterator::next() {

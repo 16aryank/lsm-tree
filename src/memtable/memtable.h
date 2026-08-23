@@ -34,7 +34,7 @@ concept ByteStorable = ByteRange<T> && std::constructible_from<T, const char*, s
 // destroyed after its flush.
 //
 // Thread-safety: guarded internally by a boost::shared_mutex. add() takes the
-// exclusive lock; get() and newIterator() take the shared lock.
+// exclusive lock; get() and cursor() take the shared lock.
 template <typename UserKey_, typename Value_>
 class MemTable {
 private:
@@ -56,6 +56,8 @@ public:
         void next() { _it.next(); }
 
         [[nodiscard]] std::string_view key() const noexcept { return _it.key(); }
+        // The packed seqnum|type, matching SSTable::Iterator::tag().
+        [[nodiscard]] uint64_t tag() const noexcept { return _it.tag(); }
         [[nodiscard]] uint64_t sequenceNumber() const noexcept { return unpackSeqNumber(_it.tag()); }
         [[nodiscard]] ValueType valueType() const noexcept { return unpackValueType(_it.tag()); }
         [[nodiscard]] std::string_view value() const noexcept { return _it.value(); }
@@ -106,10 +108,13 @@ public:
         return Value_(value_bytes.data(), value_bytes.size());
     }
 
-    // Caller owns the returned Iterator, which must not outlive this MemTable.
-    [[nodiscard]] Iterator* newIterator() const {
+    // Returned by value: an Iterator is one pointer into the arena, so there
+    // is nothing to allocate. It must not outlive this MemTable -- its keys and
+    // values are views into the arena. Callers needing a cursor that keeps the
+    // table alive use MemTableIterator, which owns a shared_ptr to it.
+    [[nodiscard]] Iterator cursor() const {
         boost::shared_lock<boost::shared_mutex> lock(_mutex);
-        return new Iterator(_table.begin());
+        return Iterator(_table.begin());
     }
 
     // Exact count of entry bytes handed out by the arena, excluding the skip

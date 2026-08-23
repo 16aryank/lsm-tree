@@ -25,7 +25,7 @@ public:
     explicit Arena(size_t first_block_bytes = kArenaFirstBlockBytes);
     ~Arena();
 
-    Arena(const Arena&)            = delete;
+    Arena(const Arena&) = delete;
     Arena& operator=(const Arena&) = delete;
 
     // Returns kArenaAlignment-aligned storage for `bytes`. Never returns
@@ -47,8 +47,8 @@ public:
 
 private:
     struct Block {
-        char*  base     = nullptr;
-        size_t capacity = 0;
+        char* base{ nullptr };
+        size_t capacity{ 0 };
         std::atomic<size_t> offset{ 0 };
     };
 

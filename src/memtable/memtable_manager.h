@@ -1,5 +1,7 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -19,6 +21,7 @@
 #include "memtable/memtable.h"
 #include "sstable/sstable.h"
 #include "sstable/sstable_builder.h"
+#include "wal/wal_codec.h"
 #include "wal/wal_writer.h"
 
 // How many times a flush is retried before the manager gives up on it for now
@@ -41,6 +44,13 @@ public:
     using MemTableFactory = std::function<MemTablePtr()>;
     using WalFactory = std::function<std::shared_ptr<WalWriter>()>;
 
+private:
+    static std::string_view bytesOf(const auto& value) noexcept {
+        return { value.data(), value.size() };
+    }
+
+public:
+
     // `sstable_dir` is where flushed tables are written, and is created if it
     // does not exist. Leaving it empty puts the manager in a memory-only mode
     // where a promoted table is dropped once it is no longer reachable rather
@@ -56,6 +66,7 @@ public:
           _sstable_dir(std::move(sstable_dir)) {
         if (!_sstable_dir.empty()) {
             std::filesystem::create_directories(_sstable_dir);
+            _next_file_number = scanForNextFileNumber(_sstable_dir);
         }
         _mutable = _memtable_factory();
         if (_wal_factory) {
@@ -75,17 +86,21 @@ public:
     void add(uint64_t seq, ValueType type, const UserKey_& key, Value_ value) {
         MemTablePtr target;
         {
-            // The lock covers the write, not just the pointer read. promote()
-            // needs the exclusive lock, so holding it here is what stops a
-            // write from landing in a table that has already been handed to a
-            // flush -- which the flush would then be iterating underneath it.
             boost::shared_lock<boost::shared_mutex> lock(_pointer_mutex);
+
+            // The WAL record goes down before the memtable insert.
+            // Inside the shared lock, so promote() cannot rotate _current_wal
+            // out from under a record describing the table it still names.
+            if (_current_wal) {
+                const std::string record =
+                    encodeWalEntry(seq, type, bytesOf(key), bytesOf(value));
+                _current_wal->addRecord(byteSpan(record));
+            }
+
             target = _mutable;
             target->add(seq, type, key, std::move(value));
         }
         // Checked outside the lock because promote() needs the exclusive one.
-        // By then `target` may already have been promoted by another writer,
-        // which promote() sorts out.
         if (target->shouldFlush()) {
             promote();
         }
@@ -93,9 +108,7 @@ public:
 
     // Returns the value with the largest sequence number <= seq for key,
     // checking the mutable MemTable, then the immutable one, then the flushed
-    // SSTables from newest to oldest. The first table holding any version of
-    // the key decides the answer -- including a tombstone, which stops the
-    // search rather than falling through to an older table.
+    // SSTables from newest to oldest.
     [[nodiscard]] std::optional<Value_> get(const UserKey_& key, uint64_t seq) const {
         MemTablePtr mutable_snapshot;
         MemTablePtr immutable_snapshot;
@@ -256,21 +269,57 @@ private:
         if (_sstable_dir.empty()) {
             return nullptr;
         }
-        std::unique_ptr<typename MemTable<UserKey_, Value_>::Iterator> it(table.newIterator());
-        if (!it->valid()) {
+        typename MemTable<UserKey_, Value_>::Iterator it = table.cursor();
+        if (!it.valid()) {
             return nullptr;
         }
 
         const std::filesystem::path path = nextSSTablePath();
         SSTableBuilder builder(path);
-        for (; it->valid(); it->next()) {
-            builder.add(it->key(), packSeqAndType(it->sequenceNumber(), it->valueType()),
-                        it->value());
+        for (; it.valid(); it.next()) {
+            builder.add(it.key(), it.tag(), it.value());
         }
         // A throw anywhere above unwinds through ~SSTableBuilder, which
         // removes the half-written file before the retry starts a new one.
         builder.finish();
         return SSTable::open(path);
+    }
+
+    // Resumes file numbering above every table already in the directory.
+    // Without this a second run over the same directory starts again at
+    // 000001.sst and O_TRUNCs the first run's data: the number is the only
+    // thing keeping flushed tables apart, and it does not otherwise survive the
+    // process.
+    //
+    // Scanning is the stopgap. The durable answer is to persist the counter
+    // alongside the rest of the file metadata, which is what a manifest is for;
+    // until then this at least stops an existing directory being overwritten.
+    [[nodiscard]] static uint64_t scanForNextFileNumber(const std::filesystem::path& dir) {
+        std::error_code ec;
+        std::filesystem::directory_iterator entries(dir, ec);
+        if (ec) {
+            return 1;
+        }
+
+        uint64_t highest = 0;
+        for (const auto& entry : entries) {
+            const std::filesystem::path& path = entry.path();
+            if (path.extension() != ".sst") {
+                continue;
+            }
+            // Only names this class produced: six digits and nothing else.
+            // Anything else in the directory is not ours to reason about.
+            const std::string stem = path.stem().string();
+            uint64_t number = 0;
+            const char* begin = stem.data();
+            const char* end = stem.data() + stem.size();
+            const auto [stop, err] = std::from_chars(begin, end, number);
+            if (err != std::errc{ } || stop != end) {
+                continue;
+            }
+            highest = std::max(highest, number);
+        }
+        return highest + 1;
     }
 
     [[nodiscard]] std::filesystem::path nextSSTablePath() {

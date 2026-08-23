@@ -35,15 +35,14 @@ int main() {
 
     // Iterator walks keys in ascending order, newest version of each key
     // first.
-    auto* it = mt.newIterator();
+    auto it = mt.cursor();
     struct Seen { std::string key; uint64_t seq; };
     std::vector<Seen> seen;
-    while (it->valid()) {
+    while (it.valid()) {
         // key() is a view into the arena; copy it out to keep it past `it`.
-        seen.push_back({ std::string(it->key()), it->sequenceNumber() });
-        it->next();
+        seen.push_back({ std::string(it.key()), it.sequenceNumber() });
+        it.next();
     }
-    delete it;
 
     std::vector<Seen> expected = {
         { "a", 3 }, { "a", 1 }, { "b", 6 }, { "b", 5 }, { "b", 2 },

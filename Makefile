@@ -70,7 +70,8 @@ $(TEST_BUILD)/%.o: $(TEST_DIR)/%.cpp
 #
 # A test covering a unit that spans directories names the extra ones here;
 # anything unlisted still links its own subdirectory alone.
-SRC_DIRS_memtable/memtable_manager := memtable/ sstable/
+SRC_DIRS_memtable/memtable_manager := memtable/ sstable/ wal/
+SRC_DIRS_iterator/merging_iterator := iterator/ sstable/ memtable/
 
 define TEST_LINK_RULE
 $(BIN_DIR)/$(1): $(TEST_BUILD)/$(1).o \

@@ -1,7 +1,5 @@
 #pragma once
 #include <cstdint>
-#include <vector>
-#include "key.h"
 
 enum class WalRecordType : uint8_t {
     kPadding    = 0, // sentinel when writer pads kHeaderSize bytes at a block boundary
@@ -26,8 +24,3 @@ struct WriteAheadLogRecord {
 
 static_assert(sizeof(WriteAheadLogRecord) == kHeaderSize);
 
-// In-memory representation of a complete (possibly reassembled) WAL entry.
-struct WalEntry {
-    WriteAheadLogRecord  header;
-    std::vector<uint8_t> payload; // header._length bytes
-};

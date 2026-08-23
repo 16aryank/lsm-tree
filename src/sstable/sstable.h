@@ -53,6 +53,10 @@ public:
         void next();
 
         [[nodiscard]] std::string_view key() const noexcept { return _current.key; }
+        // The packed seqnum|type, which is what the comparator and the builder
+        // both take -- handing it over whole saves a merge unpacking and
+        // repacking every entry it moves.
+        [[nodiscard]] uint64_t tag() const noexcept { return _current.tag; }
         [[nodiscard]] uint64_t sequenceNumber() const noexcept {
             return unpackSeqNumber(_current.tag);
         }
@@ -83,7 +87,7 @@ public:
     // telling those apart is the caller's job.
     [[nodiscard]] std::optional<Entry> get(std::string_view key, uint64_t seq) const;
 
-    [[nodiscard]] Iterator newIterator() const { return Iterator(this); }
+    [[nodiscard]] Iterator cursor() const { return Iterator(this); }
 
     [[nodiscard]] uint64_t numEntries() const noexcept { return _num_entries; }
     [[nodiscard]] uint64_t fileSize() const noexcept { return _file_size; }
@@ -94,6 +98,13 @@ public:
     // only -- the bounds a level's overlap check needs.
     [[nodiscard]] const std::string& smallestKey() const noexcept { return _smallest_key; }
     [[nodiscard]] const std::string& largestKey() const noexcept { return _largest_key; }
+
+    // The tags belonging to those two bounds, which together with the keys
+    // above give the table's *internal*-key range. A level's file metadata
+    // needs the internal bounds, not just the user-key ones: two tables can
+    // share a user key at the edge and only the tag says which is newer.
+    [[nodiscard]] uint64_t smallestTag() const noexcept { return _smallest_tag; }
+    [[nodiscard]] uint64_t largestTag() const noexcept { return _largest_tag; }
 
 private:
     // One index block entry: the last internal key of a data block, and where
@@ -125,4 +136,6 @@ private:
     std::vector<IndexEntry> _index;
     std::string             _smallest_key;
     std::string             _largest_key;
+    uint64_t                _smallest_tag = 0;
+    uint64_t                _largest_tag  = 0;
 };

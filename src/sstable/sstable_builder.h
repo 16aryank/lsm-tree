@@ -42,6 +42,12 @@ public:
     void abandon() noexcept;
 
     [[nodiscard]] inline uint64_t numEntries() const noexcept { return _num_entries; }
+
+    // Bytes committed so far plus the data block still being built. 
+    // Used to determine whether to compact SSTables.
+    [[nodiscard]] inline uint64_t estimatedSize() const noexcept {
+        return _offset + _block.size();
+    }
     [[nodiscard]] inline const std::filesystem::path& path() const noexcept { return _path; }
 
 private:

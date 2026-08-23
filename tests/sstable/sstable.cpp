@@ -87,6 +87,12 @@ int main() {
         assert(table->smallestKey() == keyAt(0));
         assert(table->largestKey() == keyAt(kKeys - 1));
 
+        // The internal-key bounds: within a user key, tags sort descending, so
+        // the smallest internal key carries the *newest* tag of the first user
+        // key, and the largest carries the oldest tag of the last one.
+        assert(table->smallestTag() == packSeqAndType(2, ValueType::kValue));
+        assert(table->largestTag() == packSeqAndType(1, ValueType::kValue));
+
         // Every key is reachable at every sequence number, including ones in
         // the middle and last blocks, which only the index can find.
         for (size_t i = 0; i < kKeys; ++i) {
@@ -127,7 +133,7 @@ int main() {
 
         // Iteration walks internal-key order across block boundaries: user key
         // ascending, newest version of each key first.
-        auto it = table->newIterator();
+        auto it = table->cursor();
         const InternalKeyComparator compare;
         std::string previous_key;
         uint64_t previous_tag = 0;
@@ -146,6 +152,31 @@ int main() {
         assert(previous_key == keyAt(kKeys - 1));
     }
 
+    // estimatedSize() grows as entries go in and stays at or below the size
+    // finish() reports -- a compaction uses it to decide when to cut an output
+    // file, so undershooting is the safe direction.
+    {
+        const std::filesystem::path path = dir / "estimate.sst";
+        uint64_t before_finish = 0;
+        uint64_t previous = 0;
+        {
+            SSTableBuilder builder(path, kTestBlockSize);
+            assert(builder.estimatedSize() == 0);
+            for (size_t i = 0; i < kKeys; ++i) {
+                builder.add(keyAt(i), packSeqAndType(1, ValueType::kValue), "value");
+                const uint64_t now = builder.estimatedSize();
+                assert(now > previous);
+                previous = now;
+            }
+            before_finish = builder.estimatedSize();
+            const uint64_t final_size = builder.finish();
+            assert(before_finish <= final_size);
+            assert(std::filesystem::file_size(path) == final_size);
+        }
+        assert(before_finish > 0);
+        std::filesystem::remove(path);
+    }
+
     // An empty table is still a valid file: a footer, and nothing to find.
     {
         const std::filesystem::path empty_path = dir / "empty.sst";
@@ -157,7 +188,7 @@ int main() {
         assert(table->numBlocks() == 0);
         assert(table->smallestKey().empty());
         assert(!table->get("anything", 100).has_value());
-        assert(!table->newIterator().valid());
+        assert(!table->cursor().valid());
     }
 
     // abandon() leaves nothing behind, which is what a failed flush relies on.

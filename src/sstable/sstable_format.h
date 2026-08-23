@@ -5,6 +5,7 @@
 #include <string_view>
 #include <boost/crc.hpp>
 
+#include "coding.h"
 #include "key.h"
 
 // The on-disk shape of an SSTable, shared by the builder and the reader.
@@ -44,33 +45,6 @@ inline constexpr size_t kFooterSize = 32;
 // "LSMSST01" in ASCII. Identifies the file and pins the format version.
 inline constexpr uint64_t kSSTableMagic = 0x4c534d5353543031ULL;
 
-// ── little-endian fixed-width primitives ──────────────────────────────────────
-
-inline void putFixed32(std::string& dst, uint32_t value) {
-    const char buf[4] = {
-        static_cast<char>(value & 0xFF),
-        static_cast<char>((value >> 8) & 0xFF),
-        static_cast<char>((value >> 16) & 0xFF),
-        static_cast<char>((value >> 24) & 0xFF),
-    };
-    dst.append(buf, sizeof(buf));
-}
-
-inline void putFixed64(std::string& dst, uint64_t value) {
-    putFixed32(dst, static_cast<uint32_t>(value & 0xFFFFFFFFULL));
-    putFixed32(dst, static_cast<uint32_t>(value >> 32));
-}
-
-[[nodiscard]] inline uint32_t decodeFixed32(const char* src) noexcept {
-    const auto* p = reinterpret_cast<const unsigned char*>(src);
-    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-}
-
-[[nodiscard]] inline uint64_t decodeFixed64(const char* src) noexcept {
-    return static_cast<uint64_t>(decodeFixed32(src)) |
-           (static_cast<uint64_t>(decodeFixed32(src + 4)) << 32);
-}
 
 [[nodiscard]] inline uint32_t blockChecksum(std::string_view contents) noexcept {
     boost::crc_32_type crc;

@@ -1,10 +1,24 @@
 #include "wal_writer.h"
 #include <boost/crc.hpp>
 #include <algorithm>
+#include <cerrno>
 #include <system_error>
 #include <unistd.h>
 #include <cassert>
 #include <fcntl.h>
+
+namespace {
+
+// fdatasync is not available on MacOS.
+int syncFile(int fd) {
+#if defined(__APPLE__)
+    return ::fsync(fd);
+#else
+    return ::fdatasync(fd);
+#endif
+}
+
+} // namespace
 
 WalWriter::WalWriter(int fd, uint64_t initial_offset)
     : _fd(fd), _file_offset(initial_offset) {}
@@ -25,8 +39,13 @@ void WalWriter::writeAll(const void* buf, size_t n) {
 }
 
 void WalWriter::padToNextBlock() {
+    // Guard on the offset, not on the remaining byte count: `tail` below is
+    // kBlockSize - blockOffset(), which is never 0, so testing it would never
+    // short-circuit and a call made at a block boundary would write a whole
+    // 32 KB block of zeros.
+    if (blockOffset() == 0) return;
+
     const uint32_t tail = kBlockSize - blockOffset();
-    if (tail == 0) return;
     static constexpr uint8_t zeros[kBlockSize]{ };
     writeAll(zeros, tail);
     // blockOffset() is now 0 because _file_offset is a multiple of kBlockSize.
@@ -50,6 +69,13 @@ void WalWriter::emitFragment(WalRecordType type, std::span<const uint8_t> payloa
 }
 
 void WalWriter::addRecord(std::span<const uint8_t> data) {
+    // One record is the atomic unit: emitFragment writes a header and then a
+    // payload, padToNextBlock may run between records, and every one of those
+    // steps advances _file_offset. Interleaving two of these would produce a
+    // log that reassembles into garbage, so the whole loop is one critical
+    // section rather than each write being individually safe.
+    std::lock_guard<std::mutex> guard(_mutex);
+
     bool           begin   = true;
     uint32_t       written = 0;
     const uint32_t total   = static_cast<uint32_t>(data.size());
@@ -70,7 +96,10 @@ void WalWriter::addRecord(std::span<const uint8_t> data) {
         const uint32_t frag_len = std::min(avail, total - written);
         const bool     last     = (written + frag_len == total);
 
-        WalRecordType type =    begin && last   ?   WalRecordType::kFirstType :
+        // A record that fits in one fragment is kFullType, not kFirstType --
+        // the reader keys its reassembly state off this, so mistyping it here
+        // leaves it waiting for a kLastType that never arrives.
+        WalRecordType type =    begin && last   ?   WalRecordType::kFullType  :
                                 begin           ?   WalRecordType::kFirstType :
                                 last            ?   WalRecordType::kLastType  :
                                                     WalRecordType::kMiddleType;
@@ -82,24 +111,15 @@ void WalWriter::addRecord(std::span<const uint8_t> data) {
 }
 
 void WalWriter::sync() {
-    // Writes the modified file and critical metadata to secure storage.
-
-    // MacOS does not support fdatasync(), use fsync().
-    // Default to fdataasync because we do not need to store
-    // metadata about file size or access time.
-
-    // fsync() does is not truly equivalent to fdataasync()
-    // because it only pushes data from the kernel to disk, not
-    // the drive's hardware cache to physical storage.
-    // This is fine because we're only concerned with application
-    // crashes, and fcntl() is very slow.
-    auto write_file = 
-#ifdef __APPLE__ && defined(__MACH__)
-    fsync(_fd);
-#else
-    ::fdataasync(_fd)
-#endif
-
-    if (write_file != 0)
+    // Pushes the written records out of the kernel's page cache. fdatasync is
+    // preferred where it exists: the WAL never needs the metadata (size, mtime)
+    // that fsync additionally flushes.
+    //
+    // Neither one flushes the drive's own write cache -- that would need
+    // F_FULLFSYNC on MacOS, which is drastically slower. Guarding against
+    // process crashes rather than power loss, which is what this buys, is the
+    // deliberate trade.
+    if (syncFile(_fd) != 0) {
         throw std::system_error(errno, std::generic_category(), "WAL sync");
+    }
 }
