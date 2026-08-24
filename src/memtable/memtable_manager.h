@@ -34,9 +34,31 @@ inline constexpr std::chrono::milliseconds kFlushRetryBackoff{ 50 };
 // Owns the "live" write path for one column of an LSM engine: a mutable
 // MemTable that absorbs new writes, and (at most) one immutable MemTable
 // that a background thread is flushing to a Level-0 SSTable.
-
-// Thread-safety: promote() takes exclusive lock, add()/get() take shared
-// lock, and the I/O flush during promote() does not hold a lock
+//
+// Thread-safety: promote() takes the exclusive pointer lock, add()/get() take
+// the shared one, and the I/O flush during promote() holds no lock at all.
+//
+// Consistency model -- what a caller may actually rely on:
+//
+//   * Reads are snapshot reads at `seq`. get(key, seq) returns the newest
+//     version of `key` at or below `seq`, and never sees a write numbered
+//     above it. Isolation comes from `seq`, not from any copying done inside
+//     get().
+//   * A write that completed before a read began is visible to that read: a
+//     memtable insert holds the exclusive lock and a lookup the shared one, so
+//     a finished add() is ordered before any later get() on the same table.
+//   * Operations that genuinely overlap in real time may be ordered either
+//     way. A get() racing a concurrent add() of a higher seq is entitled to
+//     return the older value, and does.
+//   * A key is never invisible during a flush. The immutable table is dropped
+//     and its SSTable published in one exclusive section, and a reader's own
+//     shared_ptr keeps the table alive even after the manager lets go -- so a
+//     key found before a flush is still findable during and after it.
+//
+// The reverse walk over _sstables in get() is correct only while every flushed
+// table is Level-0. It encodes "later in the vector is newer", which stops
+// being true the moment compaction writes a table holding older data than the
+// L0 files still sitting above it.
 template <typename UserKey_, typename Value_>
 class MemTableManager {
 public:
@@ -110,6 +132,12 @@ public:
     // checking the mutable MemTable, then the immutable one, then the flushed
     // SSTables from newest to oldest.
     [[nodiscard]] std::optional<Value_> get(const UserKey_& key, uint64_t seq) const {
+        // These pin *which* tables to search, not what is in them: _mutable
+        // is a live table that concurrent writers keep inserting into, so a
+        // write can land in it after this block and still be seen below. That
+        // is not a hole -- `seq` is what bounds visibility, and holding the
+        // pointers is what guarantees the tables stay alive and that the set
+        // being searched cannot change underneath a flush.
         MemTablePtr mutable_snapshot;
         MemTablePtr immutable_snapshot;
         std::vector<std::shared_ptr<SSTable>> sstables;
