@@ -7,32 +7,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-namespace {
-
-// fdatasync is not in MacOS
-int syncFile(int fd) {
-#if defined(__APPLE__)
-    return ::fsync(fd);
-#else
-    return ::fdatasync(fd);
-#endif
-}
-
-// Makes the directory entry for a newly created file durable. Without this a
-// crash can leave a fully fsynced table that the directory has never heard of.
-// Best effort: a filesystem that refuses to open a directory read-only is not
-// a reason to fail the flush.
-void syncDirectory(const std::filesystem::path& file) {
-    const std::filesystem::path dir = file.parent_path();
-    const int fd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY);
-    if (fd < 0) {
-        return;
-    }
-    ::fsync(fd);
-    ::close(fd);
-}
-
-} // namespace
+#include "util/file_util.h"
 
 SSTableBuilder::SSTableBuilder(std::filesystem::path path, size_t block_size)
     : _path(std::move(path)), _fd(-1), _block_size(block_size) {
@@ -49,19 +24,10 @@ SSTableBuilder::~SSTableBuilder() {
 }
 
 void SSTableBuilder::writeAll(const void* buf, size_t n) {
-    const auto* p = static_cast<const uint8_t*>(buf);
-    while (n > 0) {
-        const ssize_t written = ::write(_fd, p, n);
-        if (written < 0) {
-            // A signal arrived before anything was written; nothing to undo.
-            if (errno == EINTR) { continue; }
-            throw std::system_error(errno, std::generic_category(),
-                                    "SSTable write: " + _path.string());
-        }
-        p += written;
-        _offset += static_cast<uint64_t>(written);
-        n -= static_cast<size_t>(written);
-    }
+    // Plain write, not pwrite: a builder appends sequentially and owns its fd,
+    // so the file description's own offset is the right cursor to ride.
+    fileutil::writeAll(_fd, buf, n, "SSTable write: " + _path.string());
+    _offset += n;
 }
 
 void SSTableBuilder::writeBlock(const std::string& contents, BlockHandle& handle) {
@@ -99,6 +65,10 @@ void SSTableBuilder::add(std::string_view key, uint64_t tag, std::string_view va
            InternalKeyComparator{}(_last_key, _last_tag, key, tag) < 0);
 
     appendEntry(_block, key, tag, value);
+    if (_num_entries == 0) {
+        _first_key.assign(key);
+        _first_tag = tag;
+    }
     _last_key.assign(key);
     _last_tag = tag;
     ++_num_entries;
@@ -121,10 +91,7 @@ uint64_t SSTableBuilder::finish() {
     appendFooter(footer, { index_handle.offset, index_handle.size, _num_entries });
     writeAll(footer.data(), footer.size());
 
-    if (syncFile(_fd) != 0) {
-        throw std::system_error(errno, std::generic_category(),
-                                "SSTable sync: " + _path.string());
-    }
+    fileutil::syncFile(_fd, "SSTable sync: " + _path.string());
     if (::close(_fd) != 0) {
         // Deferred write errors surface here, so a failing close means the
         // table is not on disk even though every write returned success.
@@ -136,7 +103,7 @@ uint64_t SSTableBuilder::finish() {
     _fd       = -1;
     _finished = true;
 
-    syncDirectory(_path);
+    fileutil::syncDirectory(_path);
     return _offset;
 }
 

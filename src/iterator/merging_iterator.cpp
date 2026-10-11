@@ -26,6 +26,20 @@ void MergingIterator::findSmallest() {
     _current = smallest;
 }
 
+void MergingIterator::seek(std::string_view key, uint64_t tag) {
+    for (const auto& child : _children) {
+        child->seek(key, tag);
+    }
+    findSmallest();
+}
+
+void MergingIterator::seekToFirst() {
+    for (const auto& child : _children) {
+        child->seekToFirst();
+    }
+    findSmallest();
+}
+
 void MergingIterator::next() {
     if (_current == nullptr) {
         return;

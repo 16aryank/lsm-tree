@@ -48,13 +48,3 @@ inline void appendWalEntry(std::string& dst, uint64_t seq, ValueType type,
     return getVarint64(src, out.tag) && getLengthPrefixed(src, out.key) &&
            getLengthPrefixed(src, out.value) && src.empty();
 }
-
-// ── adapters between the codec's bytes and the framing layer's ────────────────
-
-[[nodiscard]] inline std::span<const uint8_t> byteSpan(const std::string& bytes) noexcept {
-    return { reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size() };
-}
-
-[[nodiscard]] inline std::string_view byteView(const std::vector<uint8_t>& bytes) noexcept {
-    return { reinterpret_cast<const char*>(bytes.data()), bytes.size() };
-}

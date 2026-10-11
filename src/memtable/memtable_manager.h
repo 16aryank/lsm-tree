@@ -1,70 +1,46 @@
 #pragma once
-#include <algorithm>
-#include <atomic>
-#include <charconv>
-#include <chrono>
 #include <cstddef>
-#include <cstdio>
-#include <exception>
-#include <filesystem>
+#include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
-#include <vector>
+#include <utility>
 #include <boost/thread/locks.hpp>
 #include <boost/thread/shared_mutex.hpp>
 
 #include "key.h"
 #include "memtable/memtable.h"
-#include "sstable/sstable.h"
-#include "sstable/sstable_builder.h"
 #include "wal/wal_codec.h"
 #include "wal/wal_writer.h"
 
-// How many times a flush is retried before the manager gives up on it for now
-// and leaves the table for a later write to retry.
-inline constexpr size_t kFlushMaxAttempts = 3;
+// A write-ahead log and the number that identifies it. The number is what a
+// manifest edit records, so rotation has to hand both back together.
+struct WalHandle {
+    uint64_t                   number{ 0 };
+    std::shared_ptr<WalWriter> writer;
+};
 
-// Waited between attempts, multiplied by the attempt number.
-inline constexpr std::chrono::milliseconds kFlushRetryBackoff{ 50 };
-
-// Owns the "live" write path for one column of an LSM engine: a mutable
-// MemTable that absorbs new writes, and (at most) one immutable MemTable
-// that a background thread is flushing to a Level-0 SSTable.
-//
-// Thread-safety: promote() takes the exclusive pointer lock, add()/get() take
-// the shared one, and the I/O flush during promote() holds no lock at all.
-//
-// Consistency model -- what a caller may actually rely on:
-//
-//   * Reads are snapshot reads at `seq`. get(key, seq) returns the newest
-//     version of `key` at or below `seq`, and never sees a write numbered
-//     above it. Isolation comes from `seq`, not from any copying done inside
-//     get().
-//   * A write that completed before a read began is visible to that read: a
-//     memtable insert holds the exclusive lock and a lookup the shared one, so
-//     a finished add() is ordered before any later get() on the same table.
-//   * Operations that genuinely overlap in real time may be ordered either
-//     way. A get() racing a concurrent add() of a higher seq is entitled to
-//     return the older value, and does.
-//   * A key is never invisible during a flush. The immutable table is dropped
-//     and its SSTable published in one exclusive section, and a reader's own
-//     shared_ptr keeps the table alive even after the manager lets go -- so a
-//     key found before a flush is still findable during and after it.
-//
-// The reverse walk over _sstables in get() is correct only while every flushed
-// table is Level-0. It encodes "later in the vector is newer", which stops
-// being true the moment compaction writes a table holding older data than the
-// L0 files still sitting above it.
+// Owns one mutable memtable, at most one immutable memtable, and the current
+// WAL. Callers commit a flushed table before calling dropImmutable().
+// Pointer swaps use an exclusive lock; add() and lookup() use a shared lock.
 template <typename UserKey_, typename Value_>
 class MemTableManager {
 public:
-    using MemTablePtr = std::shared_ptr<MemTable<UserKey_, Value_>>;
+    using MemTablePtr     = std::shared_ptr<MemTable<UserKey_, Value_>>;
     using MemTableFactory = std::function<MemTablePtr()>;
-    using WalFactory = std::function<std::shared_ptr<WalWriter>()>;
+    using WalFactory      = std::function<WalHandle()>;
+
+    // What promote() froze.
+    struct Promotion {
+        // The table to flush, or null when there is nothing to do.
+        MemTablePtr table;
+        // The log now taking writes. Everything in `table` was written to a
+        // log numbered below this one, so once the flush is recorded, those
+        // logs are deletable -- which is exactly what a manifest edit's log
+        // number means.
+        uint64_t log_number{ 0 };
+    };
 
 private:
     static std::string_view bytesOf(const auto& value) noexcept {
@@ -72,105 +48,69 @@ private:
     }
 
 public:
-
-    // `sstable_dir` is where flushed tables are written, and is created if it
-    // does not exist. Leaving it empty puts the manager in a memory-only mode
-    // where a promoted table is dropped once it is no longer reachable rather
-    // than persisted -- useful for benchmarks, never for real data.
+    // A null wal_factory supports in-memory tests and benchmarks.
     explicit MemTableManager(size_t size_threshold_bytes = kDefaultMemTableSizeBytes,
-                              WalFactory wal_factory = nullptr,
-                              std::filesystem::path sstable_dir = {})
+                             WalFactory wal_factory = nullptr)
         : _size_threshold_bytes(size_threshold_bytes),
           _memtable_factory([size_threshold_bytes] {
               return std::make_shared<MemTable<UserKey_, Value_>>(size_threshold_bytes);
           }),
-          _wal_factory(std::move(wal_factory)),
-          _sstable_dir(std::move(sstable_dir)) {
-        if (!_sstable_dir.empty()) {
-            std::filesystem::create_directories(_sstable_dir);
-            _next_file_number = scanForNextFileNumber(_sstable_dir);
-        }
+          _wal_factory(std::move(wal_factory)) {
         _mutable = _memtable_factory();
         if (_wal_factory) {
             _current_wal = _wal_factory();
         }
     }
 
-    ~MemTableManager() {
-        if (_flush_thread.joinable()) {
-            _flush_thread.join();
-        }
-    }
-
-    MemTableManager(const MemTableManager&) = delete;
+    MemTableManager(const MemTableManager&)            = delete;
     MemTableManager& operator=(const MemTableManager&) = delete;
 
     void add(uint64_t seq, ValueType type, const UserKey_& key, Value_ value) {
-        MemTablePtr target;
-        {
-            boost::shared_lock<boost::shared_mutex> lock(_pointer_mutex);
+        boost::shared_lock<boost::shared_mutex> lock(_pointer_mutex);
 
-            // The WAL record goes down before the memtable insert.
-            // Inside the shared lock, so promote() cannot rotate _current_wal
-            // out from under a record describing the table it still names.
-            if (_current_wal) {
-                const std::string record =
-                    encodeWalEntry(seq, type, bytesOf(key), bytesOf(value));
-                _current_wal->addRecord(byteSpan(record));
-            }
+        // Hold the pointer lock across WAL append and insert so rotation cannot
+        // separate a write from the log covering its memtable.
+        if (_current_wal.writer) {
+            const std::string record =
+                encodeWalEntry(seq, type, bytesOf(key), bytesOf(value));
+            _current_wal.writer->addRecord(byteSpan(record));
+        }
 
-            target = _mutable;
-            target->add(seq, type, key, std::move(value));
-        }
-        // Checked outside the lock because promote() needs the exclusive one.
-        if (target->shouldFlush()) {
-            promote();
-        }
+        _mutable->add(seq, type, key, std::move(value));
     }
 
-    // Returns the value with the largest sequence number <= seq for key,
-    // checking the mutable MemTable, then the immutable one, then the flushed
-    // SSTables from newest to oldest.
-    [[nodiscard]] std::optional<Value_> get(const UserKey_& key, uint64_t seq) const {
-        // These pin *which* tables to search, not what is in them: _mutable
-        // is a live table that concurrent writers keep inserting into, so a
-        // write can land in it after this block and still be seen below. That
-        // is not a hole -- `seq` is what bounds visibility, and holding the
-        // pointers is what guarantees the tables stay alive and that the set
-        // being searched cannot change underneath a flush.
+    // Searches the mutable table and then the immutable one. kNotFound means
+    // neither had anything to say and the caller should go on to the tables on
+    // disk; kDeleted means a tombstone covers the key and it must not.
+    [[nodiscard]] LookupStatus lookup(const UserKey_& key, uint64_t seq, Value_& out) const {
+        // Pin both tables across lookup; the sequence number bounds visibility.
         MemTablePtr mutable_snapshot;
         MemTablePtr immutable_snapshot;
-        std::vector<std::shared_ptr<SSTable>> sstables;
         {
             boost::shared_lock<boost::shared_mutex> lock(_pointer_mutex);
-            mutable_snapshot = _mutable;
+            mutable_snapshot   = _mutable;
             immutable_snapshot = _immutable;
-            sstables = _sstables;
         }
-        if (auto value = mutable_snapshot->get(key, seq)) {
-            return value;
+
+        const LookupStatus status = mutable_snapshot->lookup(key, seq, out);
+        if (status != LookupStatus::kNotFound) {
+            return status;
         }
         if (immutable_snapshot) {
-            if (auto value = immutable_snapshot->get(key, seq)) {
-                return value;
-            }
+            return immutable_snapshot->lookup(key, seq, out);
         }
-        // Level 0 tables overlap, so they have to be walked newest first.
-        const std::string_view key_bytes{ key.data(), key.size() };
-        for (auto table = sstables.rbegin(); table != sstables.rend(); ++table) {
-            std::optional<SSTable::Entry> entry = (*table)->get(key_bytes, seq);
-            if (!entry) {
-                continue;
-            }
-            if (entry->type == ValueType::kDelete) {
-                return std::nullopt;
-            }
-            return Value_(entry->value.data(), entry->value.size());
-        }
-        return std::nullopt;
+        return LookupStatus::kNotFound;
     }
 
-    [[nodiscard]] std::shared_ptr<WalWriter> currentWal() const {
+    // True once the mutable table is over its size threshold, so the caller
+    // knows to promote. Checked outside add() because promote() needs the
+    // exclusive lock that add() holds shared.
+    [[nodiscard]] bool shouldPromote() const {
+        boost::shared_lock<boost::shared_mutex> lock(_pointer_mutex);
+        return _mutable->shouldFlush();
+    }
+
+    [[nodiscard]] WalHandle currentWal() const {
         boost::shared_lock<boost::shared_mutex> lock(_pointer_mutex);
         return _current_wal;
     }
@@ -180,197 +120,56 @@ public:
         return _immutable != nullptr;
     }
 
-    // Level-0 tables, oldest first.
-    [[nodiscard]] std::vector<std::shared_ptr<SSTable>> sstables() const {
-        boost::shared_lock<boost::shared_mutex> lock(_pointer_mutex);
-        return _sstables;
-    }
-
-    // Why the last flush failed, or empty if the last one succeeded. A
-    // non-empty value alongside hasPendingFlush() means the immutable table is
-    // still in memory waiting to be retried.
-    [[nodiscard]] std::string lastFlushError() const {
-        boost::shared_lock<boost::shared_mutex> lock(_pointer_mutex);
-        return _flush_error;
-    }
-
-    // Test/debug helper: blocks until any in-flight background flush
-    // completes. Note that a completed flush is not necessarily a successful
-    // one -- check lastFlushError().
-    void waitForPendingFlush() {
-        std::lock_guard<std::mutex> flush_guard(_flush_mutex);
-        if (_flush_thread.joinable()) {
-            _flush_thread.join();
-        }
-    }
-
-private:
-    // Atomically swaps the mutable MemTable out for a fresh one, handing the
-    // old one to a background thread to flush.
+    // Freezes the mutable table, installs a fresh one and a fresh log, and
+    // returns the frozen table to be flushed.
     //
-    // If a flush is already in flight this is a no-op: the caller stays
-    // over-threshold and retries on its next write. If an earlier flush failed
-    // and left its table behind, this re-arms that table instead of promoting
-    // a new one -- writes must not stack up more than one immutable table, and
-    // the stale one has to reach disk first anyway.
-    void promote() {
-        // Serializes promotion, so concurrent writers can't both touch
-        // _flush_thread. Held across the join below, never during the flush.
-        std::lock_guard<std::mutex> flush_guard(_flush_mutex);
+    // Returns an empty Promotion if the table has room or a flush is active.
+    // A failed flush is retried before another table is frozen.
+    [[nodiscard]] Promotion promote() {
+        boost::unique_lock<boost::shared_mutex> lock(_pointer_mutex);
 
         MemTablePtr to_flush;
-        {
-            boost::unique_lock<boost::shared_mutex> lock(_pointer_mutex);
-            if (_immutable) {
-                if (_flush_in_flight) {
-                    return;
-                }
-                to_flush = _immutable; // previous attempt failed; try again
-            } else if (_mutable->shouldFlush()) {
-                to_flush = _mutable;
-                _immutable = to_flush;
-                _mutable = _memtable_factory();
-                if (_wal_factory) {
-                    _current_wal = _wal_factory();
-                }
-            } else {
-                // Another writer rotated the table this caller saw, and the
-                // fresh one has room; nothing to do.
-                return;
+        if (_immutable) {
+            if (_flush_in_flight) {
+                return { };
             }
-            _flush_in_flight = true;
+            to_flush = _immutable;
+        } else if (_mutable->shouldFlush()) {
+            to_flush   = _mutable;
+            _immutable = to_flush;
+            _mutable   = _memtable_factory();
+            if (_wal_factory) {
+                _current_wal = _wal_factory();
+            }
+        } else {
+            return { };
         }
 
-        // _flush_in_flight was false above, so any previous worker has already
-        // run its last statement; this only reaps the thread object.
-        if (_flush_thread.joinable()) {
-            _flush_thread.join();
-        }
-        _flush_thread = std::thread([this, to_flush] { flushWorker(to_flush); });
+        _flush_in_flight = true;
+        return { to_flush, _current_wal.number };
     }
 
-    // Writes `table` out, retrying a few times before giving up. A failed
-    // flush is not data loss: the table stays reachable as _immutable and its
-    // writes are still in the WAL, so the next promote() retries it.
-    void flushWorker(MemTablePtr table) {
-        std::shared_ptr<SSTable> flushed;
-        std::string error;
-
-        for (size_t attempt = 1; attempt <= kFlushMaxAttempts; ++attempt) {
-            try {
-                flushed = flushToSSTable(*table);
-                error.clear();
-                break;
-            } catch (const std::exception& e) {
-                // Typically a transient I/O error (a full or briefly
-                // unavailable disk), which is what makes a retry worth trying.
-                error = e.what();
-                if (attempt < kFlushMaxAttempts) {
-                    std::this_thread::sleep_for(kFlushRetryBackoff * attempt);
-                }
-            }
-        }
-
+    // Retires the frozen table after its SSTable is committed to the manifest.
+    void dropImmutable() {
         boost::unique_lock<boost::shared_mutex> lock(_pointer_mutex);
-        if (error.empty()) {
-            if (flushed) {
-                _sstables.push_back(std::move(flushed));
-            }
-            // Published before the table is dropped, so a concurrent get()
-            // sees the key in one place or the other, never neither.
-            _immutable.reset();
-        }
-        _flush_error = std::move(error);
+        _immutable.reset();
         _flush_in_flight = false;
     }
 
-    // Writes every version of every key in `table` to a new SSTable and opens
-    // it for reading. Returns nullptr when there is nothing to write, or when
-    // no sstable directory was configured.
-    //
-    // The memtable iterator already yields entries in internal-key order, so
-    // this is a straight copy with no sorting or buffering. It also walks the
-    // table without holding its lock, which is only sound because a promoted
-    // table is frozen: add() writes under the shared pointer lock that
-    // promote() takes exclusively, so no write can still be in flight here.
-    std::shared_ptr<SSTable> flushToSSTable(const MemTable<UserKey_, Value_>& table) {
-        if (_sstable_dir.empty()) {
-            return nullptr;
-        }
-        typename MemTable<UserKey_, Value_>::Iterator it = table.cursor();
-        if (!it.valid()) {
-            return nullptr;
-        }
-
-        const std::filesystem::path path = nextSSTablePath();
-        SSTableBuilder builder(path);
-        for (; it.valid(); it.next()) {
-            builder.add(it.key(), it.tag(), it.value());
-        }
-        // A throw anywhere above unwinds through ~SSTableBuilder, which
-        // removes the half-written file before the retry starts a new one.
-        builder.finish();
-        return SSTable::open(path);
+    // Keeps the frozen table for a later retry.
+    void abandonFlush() {
+        boost::unique_lock<boost::shared_mutex> lock(_pointer_mutex);
+        _flush_in_flight = false;
     }
 
-    // Resumes file numbering above every table already in the directory.
-    // Without this a second run over the same directory starts again at
-    // 000001.sst and O_TRUNCs the first run's data: the number is the only
-    // thing keeping flushed tables apart, and it does not otherwise survive the
-    // process.
-    //
-    // Scanning is the stopgap. The durable answer is to persist the counter
-    // alongside the rest of the file metadata, which is what a manifest is for;
-    // until then this at least stops an existing directory being overwritten.
-    [[nodiscard]] static uint64_t scanForNextFileNumber(const std::filesystem::path& dir) {
-        std::error_code ec;
-        std::filesystem::directory_iterator entries(dir, ec);
-        if (ec) {
-            return 1;
-        }
-
-        uint64_t highest = 0;
-        for (const auto& entry : entries) {
-            const std::filesystem::path& path = entry.path();
-            if (path.extension() != ".sst") {
-                continue;
-            }
-            // Only names this class produced: six digits and nothing else.
-            // Anything else in the directory is not ours to reason about.
-            const std::string stem = path.stem().string();
-            uint64_t number = 0;
-            const char* begin = stem.data();
-            const char* end = stem.data() + stem.size();
-            const auto [stop, err] = std::from_chars(begin, end, number);
-            if (err != std::errc{ } || stop != end) {
-                continue;
-            }
-            highest = std::max(highest, number);
-        }
-        return highest + 1;
-    }
-
-    [[nodiscard]] std::filesystem::path nextSSTablePath() {
-        char name[32];
-        std::snprintf(name, sizeof(name), "%06llu.sst",
-                      static_cast<unsigned long long>(_next_file_number.fetch_add(1)));
-        return _sstable_dir / name;
-    }
-
-    size_t _size_threshold_bytes;
-    MemTableFactory _memtable_factory;
-    WalFactory _wal_factory;
-    std::filesystem::path _sstable_dir;
+private:
+    size_t                _size_threshold_bytes;
+    MemTableFactory       _memtable_factory;
+    WalFactory            _wal_factory;
 
     mutable boost::shared_mutex _pointer_mutex;
-    MemTablePtr _mutable;
-    MemTablePtr _immutable;
-    std::shared_ptr<WalWriter> _current_wal;
-    std::vector<std::shared_ptr<SSTable>> _sstables;
-    std::string _flush_error;
-    bool _flush_in_flight{ false };
-
-    std::mutex _flush_mutex;
-    std::thread _flush_thread;
-    std::atomic<uint64_t> _next_file_number{ 1 };
+    MemTablePtr                 _mutable;
+    MemTablePtr                 _immutable;
+    WalHandle                   _current_wal;
+    bool                        _flush_in_flight{ false };
 };

@@ -1,8 +1,10 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // Little-endian fixed-width and varint primitives, shared by every on-disk
 // format in the engine: SSTable blocks and footers, WAL payloads, and the
@@ -103,4 +105,19 @@ inline void putLengthPrefixed(std::string& dst, std::string_view value) {
     out = src.substr(0, length);
     src.remove_prefix(length);
     return true;
+}
+
+// ── adapters between an encoded payload and the framing layer ─────────────────
+//
+// Codecs build into a std::string and WalReader hands back a
+// std::vector<uint8_t>, while WalWriter::addRecord speaks
+// std::span<const uint8_t>. These two bridge the gap, for the WAL's key/value
+// entries and the manifest's version edits alike.
+
+[[nodiscard]] inline std::span<const uint8_t> byteSpan(const std::string& bytes) noexcept {
+    return { reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size() };
+}
+
+[[nodiscard]] inline std::string_view byteView(const std::vector<uint8_t>& bytes) noexcept {
+    return { reinterpret_cast<const char*>(bytes.data()), bytes.size() };
 }

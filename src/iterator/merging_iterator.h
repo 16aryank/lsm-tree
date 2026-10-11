@@ -20,6 +20,12 @@ public:
     [[nodiscard]] bool valid() const noexcept override { return _current != nullptr; }
     void next() override;
 
+    // Seeks every child and re-picks the smallest. O(N) in children on top of
+    // whatever each child's own seek costs, which for a handful of compaction
+    // inputs is not worth a heap.
+    void seek(std::string_view key, uint64_t tag) override;
+    void seekToFirst() override;
+
     [[nodiscard]] inline std::string_view key() const noexcept override { return _current->key(); }
     [[nodiscard]] inline uint64_t tag() const noexcept override { return _current->tag(); }
     [[nodiscard]] inline std::string_view value() const noexcept override { return _current->value(); }

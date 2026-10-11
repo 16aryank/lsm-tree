@@ -1,12 +1,11 @@
 #include "wal_reader.h"
 #include <boost/crc.hpp>
 #include <algorithm>
-#include <cerrno>
 #include <cstring>
 #include <stdexcept>
 #include <string>
-#include <system_error>
-#include <unistd.h>
+
+#include "util/file_util.h"
 
 WalReader::WalReader(int fd, uint64_t initial_offset, WalReadMode mode)
     : _fd(fd), _file_offset(initial_offset), _mode(mode) { }
@@ -14,18 +13,9 @@ WalReader::WalReader(int fd, uint64_t initial_offset, WalReadMode mode)
 // ── low-level I/O ─────────────────────────────────────────────────────────────
 
 size_t WalReader::tryRead(void* buf, size_t n) {
-    auto* p   = static_cast<uint8_t*>(buf);
-    size_t got{ 0 };
-    while (got < n) {
-        ssize_t r = ::pread(_fd, p + got, n - got, static_cast<off_t>(_file_offset + got));
-        if (r < 0) {
-            // Signal was delivered to the thread while reading, no bytes are read
-            if (errno == EINTR) { continue; }
-            throw std::system_error(errno, std::generic_category(), "WAL pread");
-        }
-        if (r == 0) break; // EOF
-        got += static_cast<size_t>(r);
-    }
+    // A short count is EOF, not an error: a torn tail is exactly what recovery
+    // exists to cope with, so the caller decides what a short read means.
+    const size_t got = fileutil::preadSome(_fd, buf, n, _file_offset, "WAL pread");
     _file_offset += got;
     return got;
 }

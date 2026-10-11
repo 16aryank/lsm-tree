@@ -1,41 +1,19 @@
 #include "wal_writer.h"
 #include <boost/crc.hpp>
 #include <algorithm>
-#include <cerrno>
-#include <system_error>
-#include <unistd.h>
 #include <cassert>
-#include <fcntl.h>
 
-namespace {
-
-// fdatasync is not available on MacOS.
-int syncFile(int fd) {
-#if defined(__APPLE__)
-    return ::fsync(fd);
-#else
-    return ::fdatasync(fd);
-#endif
-}
-
-} // namespace
+#include "util/file_util.h"
 
 WalWriter::WalWriter(int fd, uint64_t initial_offset)
     : _fd(fd), _file_offset(initial_offset) {}
 
 void WalWriter::writeAll(const void* buf, size_t n) {
-    const auto* p = static_cast<const uint8_t*>(buf);
-    while (n > 0) {
-        ssize_t r = ::pwrite(_fd, p, n, static_cast<off_t>(_file_offset));
-        if (r < 0) {
-            // Signal was delivered to the thread while written, no bytes are written
-            if (errno == EINTR) { continue; }
-            throw std::system_error(errno, std::generic_category(), "WAL pwrite");
-        }
-        p += r;
-        _file_offset += static_cast<uint64_t>(r);
-        n -= static_cast<size_t>(r);
-    }
+    // pwrite rather than write: the offset the WAL appends at is _file_offset,
+    // which this class tracks itself, so the fd's own offset is never consulted
+    // and a reader may share the same open file description.
+    fileutil::pwriteAll(_fd, buf, n, _file_offset, "WAL pwrite");
+    _file_offset += n;
 }
 
 void WalWriter::padToNextBlock() {
@@ -111,15 +89,5 @@ void WalWriter::addRecord(std::span<const uint8_t> data) {
 }
 
 void WalWriter::sync() {
-    // Pushes the written records out of the kernel's page cache. fdatasync is
-    // preferred where it exists: the WAL never needs the metadata (size, mtime)
-    // that fsync additionally flushes.
-    //
-    // Neither one flushes the drive's own write cache -- that would need
-    // F_FULLFSYNC on MacOS, which is drastically slower. Guarding against
-    // process crashes rather than power loss, which is what this buys, is the
-    // deliberate trade.
-    if (syncFile(_fd) != 0) {
-        throw std::system_error(errno, std::generic_category(), "WAL sync");
-    }
+    fileutil::syncFile(_fd, "WAL sync");
 }

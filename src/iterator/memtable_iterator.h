@@ -19,6 +19,9 @@ public:
     [[nodiscard]] bool valid() const noexcept override { return _it.valid(); }
     void next() override { _it.next(); }
 
+    void seek(std::string_view key, uint64_t tag) override { _it.seek(key, tag); }
+    void seekToFirst() override { _it.seekToFirst(); }
+
     [[nodiscard]] std::string_view key() const noexcept override { return _it.key(); }
     [[nodiscard]] uint64_t tag() const noexcept override { return _it.tag(); }
     [[nodiscard]] std::string_view value() const noexcept override { return _it.value(); }

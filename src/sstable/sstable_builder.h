@@ -6,16 +6,8 @@
 
 #include "sstable/sstable_format.h"
 
-// Writes one immutable SSTable, in a single forward pass, from entries handed
-// to it in internal-key order -- exactly the order a MemTable iterator yields.
-// Nothing is buffered beyond the current data block and the index.
-//
-// The file is only valid once finish() returns: it writes the footer last, so
-// a crash mid-build leaves a file with no magic number at its tail, which the
-// reader rejects. Anything that goes wrong throws std::system_error and leaves
-// the partial file to be removed by abandon() (or by the destructor).
-//
-// Thread-safety: none. One builder belongs to one flush.
+// Writes sorted entries in one pass. finish() writes the footer last and syncs
+// the file; abandon() or the destructor removes an unfinished file.
 class SSTableBuilder {
 public:
     // Creates path. Throws std::system_error if it cannot be opened.
@@ -24,7 +16,6 @@ public:
     // Removes the file unless finish() completed.
     ~SSTableBuilder();
 
-    // Delete copy constructors.
     SSTableBuilder(const SSTableBuilder&) = delete;
     SSTableBuilder& operator=(const SSTableBuilder&) = delete;
 
@@ -43,12 +34,17 @@ public:
 
     [[nodiscard]] inline uint64_t numEntries() const noexcept { return _num_entries; }
 
-    // Bytes committed so far plus the data block still being built. 
-    // Used to determine whether to compact SSTables.
+    // Bytes written plus the current data block.
     [[nodiscard]] inline uint64_t estimatedSize() const noexcept {
         return _offset + _block.size();
     }
     [[nodiscard]] inline const std::filesystem::path& path() const noexcept { return _path; }
+
+    // Internal-key bounds, valid once at least one entry has been added.
+    [[nodiscard]] inline const std::string& smallestKey() const noexcept { return _first_key; }
+    [[nodiscard]] inline uint64_t smallestTag() const noexcept { return _first_tag; }
+    [[nodiscard]] inline const std::string& largestKey() const noexcept { return _last_key; }
+    [[nodiscard]] inline uint64_t largestTag() const noexcept { return _last_tag; }
 
 private:
     // Writes `contents` plus its CRC trailer at the current offset and fills
@@ -69,6 +65,11 @@ private:
 
     std::string _block; // data block under construction
     std::string _index; // index block, one entry per finished data block
+
+    // First key added. Entries arrive in internal-key order, so this is the
+    // table's lower bound.
+    std::string _first_key;
+    uint64_t _first_tag = 0;
 
     // Last key added, which is also the index key for the block being built.
     std::string _last_key;

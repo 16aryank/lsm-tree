@@ -11,21 +11,11 @@
 #include "key.h"
 #include "sstable/sstable_format.h"
 
-// A read-only, immutable table on disk: the thing a MemTable becomes when it
-// is flushed. Written by SSTableBuilder, never modified afterwards.
-//
-// open() pulls the footer and the whole index block into memory and keeps the
-// file open; data blocks are read on demand and not cached, so the resident
-// cost of a table is its index plus one file descriptor. Every read verifies
-// the block's CRC before looking at it.
-//
-// Thread-safety: get() and iteration are const and use pread(), which carries
-// its own offset, so any number of threads may read one table concurrently.
+// Immutable sorted table. The index stays in memory; checked data blocks are
+// read on demand. pread() permits concurrent readers on one table.
 class SSTable {
 public:
-    // What a lookup found. `type` matters as much as the value: a kDelete hit
-    // is a tombstone, meaning the key is absent as of `seq` and older tables
-    // must not be consulted.
+    // A kDelete entry masks older versions in other tables.
     struct Entry {
         uint64_t    seq  = 0;
         ValueType   type = ValueType::kValue;
@@ -41,28 +31,23 @@ public:
     SSTable(const SSTable&)            = delete;
     SSTable& operator=(const SSTable&) = delete;
 
-    // Forward-only cursor over every version of every key, in internal-key
-    // order (user key ascending, newest version of each key first) -- the same
-    // order MemTable::Iterator yields, which is what lets a merge walk both.
-    //
-    // key() and value() point into a block this iterator holds and are
-    // invalidated by next(). The SSTable must outlive the iterator.
+    // Forward cursor in internal-key order. Views are invalidated by next(),
+    // and the table must outlive the iterator.
     class Iterator {
     public:
-        // Non-copyable: _current holds views into _buffer, so a copy would keep
-        // pointing at the source's block and dangle the moment that source
-        // died. Nothing needs to copy a forward-only cursor, and cursor()
-        // returns a prvalue, so this costs no caller anything.
+        // _current contains views into _buffer.
         Iterator(const Iterator&) = delete;
         Iterator& operator=(const Iterator&) = delete;
 
         [[nodiscard]] bool valid() const noexcept { return _valid; }
         void next();
 
+        // Positions at the first entry at or after (key, tag).
+        void seek(std::string_view key, uint64_t tag);
+        void seekToFirst() { loadBlock(0); }
+
         [[nodiscard]] std::string_view key() const noexcept { return _current.key; }
-        // The packed seqnum|type, which is what the comparator and the builder
-        // both take -- handing it over whole saves a merge unpacking and
-        // repacking every entry it moves.
+        // Packed sequence number and value type.
         [[nodiscard]] uint64_t tag() const noexcept { return _current.tag; }
         [[nodiscard]] uint64_t sequenceNumber() const noexcept {
             return unpackSeqNumber(_current.tag);
@@ -88,10 +73,7 @@ public:
         bool             _valid = false;
     };
 
-    // Returns the entry with the largest sequence number <= seq for key, or
-    // nullopt if the table has no version of that key at or below seq. A
-    // tombstone is returned as an Entry with type kDelete, not as nullopt:
-    // telling those apart is the caller's job.
+    // Finds the newest entry visible at seq. Tombstones return kDelete.
     [[nodiscard]] std::optional<Entry> get(std::string_view key, uint64_t seq) const;
 
     [[nodiscard]] Iterator cursor() const { return Iterator(this); }
@@ -106,10 +88,7 @@ public:
     [[nodiscard]] const std::string& smallestKey() const noexcept { return _smallest_key; }
     [[nodiscard]] const std::string& largestKey() const noexcept { return _largest_key; }
 
-    // The tags belonging to those two bounds, which together with the keys
-    // above give the table's *internal*-key range. A level's file metadata
-    // needs the internal bounds, not just the user-key ones: two tables can
-    // share a user key at the edge and only the tag says which is newer.
+    // Tags complete the table's internal-key bounds.
     [[nodiscard]] uint64_t smallestTag() const noexcept { return _smallest_tag; }
     [[nodiscard]] uint64_t largestTag() const noexcept { return _largest_tag; }
 
@@ -123,6 +102,9 @@ private:
     };
 
     SSTable(std::filesystem::path path, int fd) noexcept;
+
+    // First block whose last internal key is at or after (key, tag).
+    [[nodiscard]] size_t findBlock(std::string_view key, uint64_t tag) const noexcept;
 
     // Reads the footer and index block, then the first data block to learn the
     // smallest key. Throws on anything malformed.

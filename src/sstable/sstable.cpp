@@ -9,6 +9,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "util/file_util.h"
+
 namespace {
 
 [[noreturn]] void corrupt(const std::filesystem::path& path, const std::string& what) {
@@ -39,20 +41,13 @@ std::shared_ptr<SSTable> SSTable::open(std::filesystem::path path) {
 }
 
 void SSTable::readAll(void* buf, size_t n, uint64_t offset) const {
-    auto* p = static_cast<uint8_t*>(buf);
-    while (n > 0) {
-        const ssize_t got = ::pread(_fd, p, n, static_cast<off_t>(offset));
-        if (got < 0) {
-            if (errno == EINTR) { continue; }
-            throw std::system_error(errno, std::generic_category(),
-                                    "SSTable pread: " + _path.string());
-        }
-        if (got == 0) {
-            corrupt(_path, "unexpected end of file");
-        }
-        p += got;
-        offset += static_cast<uint64_t>(got);
-        n -= static_cast<size_t>(got);
+    // A table is a fixed, fully written artifact -- unlike the WAL, a short
+    // read here is never a torn tail, it means the file is not the table the
+    // index claims it is.
+    const size_t got = fileutil::preadSome(_fd, buf, n, offset,
+                                           "SSTable pread: " + _path.string());
+    if (got < n) {
+        corrupt(_path, "unexpected end of file");
     }
 }
 
@@ -137,6 +132,15 @@ void SSTable::loadIndex() {
     _smallest_tag = entry.tag;
 }
 
+size_t SSTable::findBlock(std::string_view key, uint64_t tag) const noexcept {
+    const InternalKeyComparator compare;
+    const auto block = std::partition_point(
+        _index.begin(), _index.end(), [&](const IndexEntry& e) {
+            return compare(e.key, e.tag, key, tag) < 0;
+        });
+    return static_cast<size_t>(block - _index.begin());
+}
+
 std::optional<SSTable::Entry> SSTable::get(std::string_view key, uint64_t seq) const {
     if (_index.empty()) {
         return std::nullopt;
@@ -146,17 +150,12 @@ std::optional<SSTable::Entry> SSTable::get(std::string_view key, uint64_t seq) c
     // the caller is allowed to see; anything newer sorts before it.
     const uint64_t target_tag = packSeqAndType(seq, ValueType::kValue);
 
-    // Blocks are keyed by their last entry, so the first block whose last key
-    // is >= the target is the only one that can hold it.
-    const auto block = std::partition_point(
-        _index.begin(), _index.end(), [&](const IndexEntry& e) {
-            return compare(e.key, e.tag, key, target_tag) < 0;
-        });
-    if (block == _index.end()) {
+    const size_t block_index = findBlock(key, target_tag);
+    if (block_index == _index.size()) {
         return std::nullopt;
     }
 
-    const std::string contents = readBlock(block->handle);
+    const std::string contents = readBlock(_index[block_index].handle);
     size_t            offset   = 0;
     SSTableEntryView  entry;
     while (offset < contents.size()) {
@@ -214,4 +213,30 @@ void SSTable::Iterator::next() {
         corrupt(_table->_path, "truncated data entry");
     }
     _offset = next;
+}
+
+void SSTable::Iterator::seek(std::string_view key, uint64_t tag) {
+    const size_t block_index = _table->findBlock(key, tag);
+    if (block_index == _table->_index.size()) {
+        // Every entry in the table sorts before the target.
+        _buffer.clear();
+        _current = { };
+        _valid   = false;
+        return;
+    }
+
+    loadBlock(block_index);
+    if (!_valid) {
+        return;
+    }
+
+    // loadBlock leaves the cursor on the block's first entry; walk forward to
+    // the first one at or after the target. The index guarantees the block's
+    // last entry is >= the target, so this cannot run off the end -- except
+    // when loadBlock skipped an empty block and landed on a later one, whose
+    // first entry is already past the target and is the right answer anyway.
+    const InternalKeyComparator compare;
+    while (_valid && compare(_current.key, _current.tag, key, tag) < 0) {
+        next();
+    }
 }
