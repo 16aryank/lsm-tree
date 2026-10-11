@@ -1,37 +1,4 @@
-// Head-to-head benchmark: the arena-backed MemTable against the pre-arena one
-// kept in src/deprecated/.
-//
-// Measures, for each implementation:
-//   - insert throughput
-//   - point-lookup throughput
-//   - full-scan (flush-path) throughput
-//   - resident bytes per entry, and what the table itself reports
-//
-// Run it with its own target, which pins -O2 so the numbers stay meaningful:
-//     make memtable_benchmark                  # default entry count
-//     make memtable_benchmark ARGS=1000000     # override the entry count
-//
-// It is deliberately excluded from `make` and `make test`.
-//
-// ------Results-------------------------------------------------------------
-// Head-to-head at 1M entries (-O2)
-
-//                          insert s     insert/s      ns/op     lookup/s      ns/op       scan/s      ns/op
-// arena                       0.901      1109445      901.4       584965     1709.5     13134333       76.1
-// deprecated (pre-arena)      1.826       547618     1826.1       298135     3354.2      7103894      140.8
-// arena speedup                            2.03x                   1.96x                   1.85x
-
-//                           RSS delta    B/entry   overhead     reported    B/entry       amp
-// arena                     192315392      192.3       42.3    189981832      190.0     1.28x
-// deprecated (pre-arena)    382025728      382.0      232.0    254000000      254.0     2.55x
-// arena reduction               1.99x
-
-// These tests also surfaced a bug in the old implementation:
-// The pre-arena skiplist cannot be destroyed past ~131k entries
-// It segfaults because _head owns the level-0 chain through nested shared_ptrs, 
-// so ~SkipList recurses once per node and overflows the 8 MB main-thread stack. 
-
-// Tests compare against deprecated version
+// Compares arena and legacy memtable throughput and resident memory.
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 #include "src/deprecated/memtable.h"
@@ -48,15 +15,11 @@
 
 namespace {
 
-// One 4 MB memtable holds roughly 22k entries at this shape, so the default is
-// about a dozen memtables' worth of sustained ingest -- enough for the timing
-// to be dominated by the data structure rather than by start-up noise.
+// Enough entries to measure sustained ingest beyond startup costs.
 constexpr size_t kDefaultEntries = 250000;
 constexpr size_t kKeyBytes       = 50;
 constexpr size_t kValueBytes     = 100;
 
-// Both implementations use the same skip-list height cap (12), so the
-// comparison is apples-to-apples even where that cap is limiting.
 using Clock   = std::chrono::steady_clock;
 using Seconds = std::chrono::duration<double>;
 
@@ -97,15 +60,7 @@ struct Result {
     uint64_t checksum          = 0; // keeps the lookup loop from being optimized away
 };
 
-// Runs the same workload against whichever MemTable type is passed in.
-// `Table` differs between the two, and so do the iterator's accessors, so the
-// scan is handed in as a lambda.
-//
-// kLeak exists because the deprecated skip list owns its nodes through a
-// shared_ptr chain, so destroying it recurses once per node and overflows the
-// 8 MB main-thread stack at roughly 131k entries. Deliberately leaking it is
-// the only way to benchmark it at a realistic size; the process is about to
-// exit anyway.
+// kLeak avoids recursive destruction of the legacy shared_ptr node chain.
 template <typename Table, bool kLeak, typename ScanFn>
 Result runWorkload(const char* name, size_t entries, ScanFn scan) {
     Result result;

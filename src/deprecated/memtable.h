@@ -12,17 +12,7 @@
 #include "key.h"
 #include "deprecated/skiplist.h"
 
-// DEPRECATED -- the pre-arena memtable, kept only so the benchmark can measure
-// the arena rewrite against it. Superseded by src/memtable/memtable.h.
-//
-// Its size accounting is the reason the rewrite happened: kEntryOverheadBytes
-// models only the skip list's own bookkeeping and ignores the std::string heap
-// buffers each entry actually owns, so it reports roughly 254 B/entry for a
-// 50-byte key and 100-byte value that really costs ~384 B resident. This is
-// an unacceptable memory overhead cost, making ~66% of the overhead from bookkeeping.
-//
-// Everything lives in namespace deprecated so this header can be included
-// alongside the current one in a single translation unit.
+// Legacy implementation retained for the memtable benchmark.
 namespace deprecated {
 
 inline constexpr size_t kDefaultMemTableSizeBytes = 4ull << 20; // 4 MB
@@ -87,18 +77,7 @@ size_t approxByteSize(const T& value) {
 // SkipList uses p=0.5 for level promotion; a node's expected number of forward pointers is 1/(1-p) = 2.
 inline constexpr size_t kExpectedForwardLevels = 2;
 
-// Per-entry bookkeeping the skip list adds on top of the raw key/value
-// bytes, derived from SkipList::Node's layout:
-//   - the std::shared_ptr<Value_> handle stored inline in Node
-//   - std::vector<shared_ptr<Node>> forward's inline {begin,end,cap} control
-//     block
-//   - forward's heap-allocated backing array, sized to the node's expected
-//     level (kExpectedForwardLevels shared_ptr<Node> slots)
-//   - the two heap allocations' control blocks from make_shared<Node> and
-//     make_shared<Value_> (refcounts + deleter, ~2 pointers each)
-//
-// Known to undercount by more than 2x: it omits the key's and value's own
-// string buffers, std::optional's engaged flag, and malloc bucket slack.
+// Estimated node bookkeeping; excludes separately allocated string buffers.
 inline constexpr size_t kEntryOverheadBytes =
     sizeof(std::shared_ptr<void>) +
     sizeof(std::vector<std::shared_ptr<void>>) +

@@ -1,6 +1,4 @@
-// Round-trip through WalWriter and WalReader: fragment typing, records that
-// span blocks, the block-padding path, how a torn tail is treated in each of
-// the two read modes, and that concurrent appends stay intact.
+// WAL framing, torn tails, and concurrent appends.
 #include "src/wal/wal_codec.h"
 #include "src/wal/wal_reader.h"
 #include "src/wal/wal_writer.h"
@@ -140,15 +138,7 @@ int main() {
         ::close(fd);
     }
 
-    // The padding path, aimed by hand rather than left to chance.
-    //
-    // A first record of exactly kMaxPayload - kHeaderSize bytes costs
-    // kHeaderSize + that = kBlockSize - kHeaderSize bytes, leaving precisely
-    // kHeaderSize bytes of block tail. That is the one width the writer pads
-    // with a full zero header rather than a short run, and the width at which
-    // the reader used to consume the padding, find itself already on the block
-    // boundary, and then skip a further kBlockSize -- discarding the whole of
-    // the next block.
+    // Exercise the case where exactly one header-width remains in a block.
     {
         const auto path = dir / "padding.log";
         const auto filler = payloadOf(kBlockSize - 2 * kHeaderSize, 11);
@@ -291,8 +281,7 @@ int main() {
         }
     }
 
-    // A reader resumes from a saved offset, which is what appending to an
-    // existing log and replaying only its tail will need.
+    // Reader and writer resume from saved offsets.
     {
         const auto path = dir / "resume.log";
         const auto first  = payloadOf(80, 51);
@@ -313,8 +302,6 @@ int main() {
         assert(!reader.readRecord().has_value());
         ::close(fd);
 
-        // And a writer resuming at the same offset appends rather than
-        // overwriting, since it preads at an explicit offset.
         const int wfd = ::open(path.c_str(), O_WRONLY);
         assert(wfd >= 0);
         WalWriter appender(wfd, std::filesystem::file_size(path));

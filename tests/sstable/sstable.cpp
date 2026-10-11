@@ -1,6 +1,4 @@
-// Round-trip through SSTableBuilder and SSTable: sequence-number and tombstone
-// semantics on get(), multi-block seeks, iteration order, checksum enforcement,
-// and rejection of files that aren't well-formed tables.
+// SSTable round trips, point reads, iteration, and corruption checks.
 
 #include "src/sstable/sstable.h"
 #include "src/sstable/sstable_builder.h"

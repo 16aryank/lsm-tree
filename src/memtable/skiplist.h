@@ -15,27 +15,9 @@
 inline constexpr size_t kMaxSkipListLevel     = 16;
 inline constexpr size_t kDefaultSkipListLevel = 12;
 
-// An ordered map of byte-string keys to byte-string values, stored entirely in
-// an Arena.
-//
-// Each entry is one arena allocation laid out as a fixed header, the node's
-// forward pointers, then the key and value bytes inline:
-//
-//     +0   tag        uint64   packed seqnum|type
-//     +8   key_len    uint32
-//     +12  value_len  uint32
-//     +16  level      uint32
-//     +20  reserved   uint32
-//     +24  forward[level]      Node*, 8 bytes each
-//     ...  key bytes (estimated to be ~50 bytes in practice)
-//     ...  value bytes (estimated to be ~100 bytes in practice)
-//
-// Lifetime: nodes live exactly as long as the Arena passed to the constructor,
-// which must outlive the list. Nothing stored here has a destructor, and
-// nothing is ever individually freed -- remove() only unlinks.
-//
-// Thread-safety: none. Callers synchronize externally (MemTable holds a
-// shared_mutex). The Arena underneath is thread-safe on its own.
+// Ordered byte-string entries allocated in an Arena. A node contains a fixed
+// header, forward pointers, then inline key and value bytes. The arena must
+// outlive the list. Callers synchronize list operations externally.
 template <typename Comparator = InternalKeyComparator>
 class SkipList {
 private:
@@ -72,9 +54,7 @@ public:
     explicit SkipList(Arena& arena, size_t maximum_level = kDefaultSkipListLevel)
         : _arena(&arena), _maximum_level(maximum_level) {
         assert(maximum_level >= 1 && maximum_level <= kMaxSkipListLevel);
-        // Head sentinel: no key or value, full height so every level has a
-        // starting point. Its key is never compared -- traversal only ever
-        // looks at a node's successors.
+        // Full-height head sentinel.
         _head = newNode({}, 0, {}, static_cast<uint32_t>(maximum_level));
     }
 
@@ -102,12 +82,8 @@ public:
         Node* _node = nullptr;
     };
 
-    // Copies `key` and `value` into the arena. Always links a new node; an
-    // entry with an identical (key, tag) is shadowed rather than replaced,
-    // because inline values are variably sized and can't be overwritten in
-    // place. The new node lands ahead of any equal one, so lookups see it
-    // first -- which is the ordering an LSM wants anyway, since a later write
-    // carries a higher sequence number.
+    // Copies the entry into the arena. Identical (key, tag) entries shadow
+    // older duplicates because inline values may have different lengths.
     void insert(std::string_view key, uint64_t tag, std::string_view value) {
         Node* update[kMaxSkipListLevel];
         findPredecessors(key, tag, update);
@@ -216,13 +192,7 @@ private:
         return forwardOf(cur)[0];
     }
 
-    // Fills update[i] with the last node at level i ordering strictly before
-    // (key, tag). Writes all _maximum_level entries -- levels the list hasn't
-    // grown into simply get the head -- so insert() needs no special case for
-    // a node taller than anything currently linked.
-    //
-    // `update` must have room for _maximum_level entries; callers pass a
-    // kMaxSkipListLevel stack array, which is why this allocates nothing.
+    // Fills every predecessor slot; update has room for kMaxSkipListLevel nodes.
     void findPredecessors(std::string_view key, uint64_t tag, Node** update) const {
         Node* cur = _head;
         for (size_t i = _maximum_level; i-- > 0;) {

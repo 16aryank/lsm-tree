@@ -6,24 +6,7 @@
 #include <random>
 #include <vector>
 
-// DEPRECATED -- the pre-arena skip list, kept only so the benchmark can
-// measure the arena rewrite against it. Superseded by src/memtable/skiplist.h.
-//
-// Every entry here costs five heap allocations: the node (via make_shared,
-// which also carries a control block), the value (a second make_shared with a
-// second control block), the forward vector's backing array, and the key's and
-// value's own string buffers. Every pointer hop copies a shared_ptr, so
-// traversal pays two atomic refcount operations per step.
-//
-// It also cannot be destroyed at scale: _head owns the level-0 chain through
-// nested shared_ptrs, so ~SkipList recurses once per node and overflows the
-// 8 MB main-thread stack at roughly 131k entries. That never surfaced in
-// practice only because a 4 MB memtable holds ~22k entries, but it is a latent
-// crash for any larger threshold. The arena rewrite has no such limit --
-// teardown is a munmap per block.
-//
-// Everything lives in namespace deprecated so this header can be included
-// alongside the current one in a single translation unit.
+// Legacy implementation retained for the memtable benchmark.
 namespace deprecated {
 
 // Key_ must support the ordering skip-list traversal relies on.
