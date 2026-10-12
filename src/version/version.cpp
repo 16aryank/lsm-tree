@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -169,18 +170,31 @@ std::shared_ptr<Version> VersionBuilder::build() {
     }
 
     auto version = std::make_shared<Version>();
+    std::set<uint64_t> numbers;
 
     for (int level = 0; level < kNumLevels; ++level) {
         std::vector<FileHandle>& out = version->_files[static_cast<size_t>(level)];
         out.reserve(_levels[static_cast<size_t>(level)].size());
 
         for (const auto& [number, meta] : _levels[static_cast<size_t>(level)]) {
+            if (number == 0 || !numbers.insert(number).second ||
+                meta.smallest_key > meta.largest_key ||
+                (meta.smallest_key == meta.largest_key && meta.smallest_tag < meta.largest_tag)) {
+                throw std::runtime_error("invalid table metadata in version");
+            }
             FileHandle handle;
             handle.meta = meta;
             if (const auto it = open.find(number); it != open.end()) {
                 handle.table = it->second;
             } else {
                 handle.table = SSTable::open(tableFileName(_dir, number));
+            }
+            if (handle.table->fileSize() != meta.file_size ||
+                handle.table->smallestKey() != meta.smallest_key ||
+                handle.table->smallestTag() != meta.smallest_tag ||
+                handle.table->largestKey() != meta.largest_key ||
+                handle.table->largestTag() != meta.largest_tag) {
+                throw std::runtime_error("table metadata does not match file");
             }
             out.push_back(std::move(handle));
         }
@@ -197,6 +211,11 @@ std::shared_ptr<Version> VersionBuilder::build() {
             std::sort(out.begin(), out.end(), [](const FileHandle& a, const FileHandle& b) {
                 return a.meta.smallest_key < b.meta.smallest_key;
             });
+            for (size_t i = 1; i < out.size(); ++i) {
+                if (out[i - 1].meta.largest_key >= out[i].meta.smallest_key) {
+                    throw std::runtime_error("overlapping tables in sorted level");
+                }
+            }
         }
     }
 

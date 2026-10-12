@@ -1,6 +1,8 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -21,12 +23,16 @@
 
 #include "db/filename.h"
 #include "db/options.h"
+#include "iterator/concatenating_iterator.h"
+#include "iterator/merging_iterator.h"
+#include "iterator/sstable_iterator.h"
 #include "key.h"
 #include "memtable/memtable.h"
 #include "memtable/memtable_manager.h"
 #include "sstable/sstable_builder.h"
 #include "util/file_util.h"
 #include "version/version.h"
+#include "version/compaction.h"
 #include "version/version_edit.h"
 #include "version/version_set.h"
 #include "wal/wal_codec.h"
@@ -39,6 +45,15 @@ inline constexpr size_t kFlushMaxAttempts = 3;
 
 // Waited between attempts, multiplied by the attempt number.
 inline constexpr std::chrono::milliseconds kFlushRetryBackoff{ 50 };
+
+struct CompactionStats {
+    uint64_t input_bytes = 0;
+    uint64_t output_bytes = 0;
+    uint64_t input_files = 0;
+    uint64_t runs = 0;
+    std::array<uint64_t, kNumLevels> runs_by_level{};
+    std::chrono::nanoseconds elapsed{};
+};
 
 // Coordinates the memtable, WAL, SSTables, and manifest. WAL appends precede
 // memtable inserts; ordinary writes do not sync the WAL before returning.
@@ -64,9 +79,19 @@ public:
 
     ~DB() {
         // Recovery replays any writes remaining in the WAL after close.
-        std::lock_guard<std::mutex> guard(_flush_mutex);
-        if (_flush_thread.joinable()) {
-            _flush_thread.join();
+        {
+            std::lock_guard<std::mutex> guard(_flush_mutex);
+            if (_flush_thread.joinable()) {
+                _flush_thread.join();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> guard(_compaction_mutex);
+            _stop_compaction = true;
+        }
+        _compaction_cv.notify_all();
+        if (_compaction_thread.joinable()) {
+            _compaction_thread.join();
         }
     }
 
@@ -112,7 +137,10 @@ public:
 
     // A sequence number to read at later, so a series of get()s can see one
     // consistent state regardless of what is written in between.
-    [[nodiscard]] uint64_t snapshot() const { return _versions.lastSequence(); }
+    [[nodiscard]] uint64_t snapshot() const {
+        std::lock_guard<std::mutex> guard(_write_mutex);
+        return _versions.lastSequence();
+    }
 
     // Test and shutdown helper: blocks until any in-flight flush finishes. A
     // finished flush is not necessarily a successful one -- check
@@ -130,6 +158,24 @@ public:
     [[nodiscard]] std::string lastFlushError() const {
         std::lock_guard<std::mutex> guard(_error_mutex);
         return _flush_error;
+    }
+
+    void waitForPendingCompaction() {
+        waitForPendingFlush();
+        std::unique_lock<std::mutex> lock(_compaction_mutex);
+        _compaction_cv.wait(lock, [this] {
+            return !_compaction_requested && !_compaction_running;
+        });
+    }
+
+    [[nodiscard]] std::string lastCompactionError() const {
+        std::lock_guard<std::mutex> guard(_compaction_mutex);
+        return _compaction_error;
+    }
+
+    [[nodiscard]] CompactionStats compactionStats() const {
+        std::lock_guard<std::mutex> guard(_compaction_mutex);
+        return _compaction_stats;
     }
 
     [[nodiscard]] const Options& options() const noexcept { return _options; }
@@ -157,6 +203,8 @@ private:
                 throw std::runtime_error("database already exists: " + _options.dir.string());
             }
             _versions.recover();
+            // Clear crash leftovers before replay allocates new table numbers.
+            removeObsoleteFiles();
             replayLogs();
         }
 
@@ -171,6 +219,8 @@ private:
         }
 
         removeObsoleteFiles();
+        _compaction_thread = std::thread([this] { compactionWorker(); });
+        requestCompaction();
     }
 
     // Rebuilds whatever the logs still hold that no table does, and flushes it
@@ -187,6 +237,7 @@ private:
             // a table; replaying it would resurrect deleted keys.
             if (type == FileType::kLog && number >= _versions.logNumber()) {
                 numbers.push_back(number);
+                _versions.advanceFileNumberPast(number);
             }
         }
         // Replay logs in file-number order.
@@ -239,13 +290,19 @@ private:
         }
         std::lock_guard<std::mutex> guard(_manifest_mutex);
         _versions.logAndApply(edit);
+        if (meta.number != 0) {
+            _pending_tables.erase(meta.number);
+        }
     }
 
     // ── write path ────────────────────────────────────────────────────────────
 
     void write(ValueType type, const UserKey_& key, Value_ value) {
-        const uint64_t seq = _versions.newSequence();
-        _memtables->add(seq, type, key, std::move(value));
+        {
+            std::lock_guard<std::mutex> guard(_write_mutex);
+            const uint64_t seq = _versions.newSequence();
+            _memtables->add(seq, type, key, std::move(value));
+        }
 
         if (_memtables->shouldPromote()) {
             scheduleFlush();
@@ -274,11 +331,13 @@ private:
         std::string error;
 
         for (size_t attempt = 1; attempt <= kFlushMaxAttempts; ++attempt) {
+            std::optional<uint64_t> output_number;
             try {
                 VersionEdit  edit;
                 FileMetaData meta;
                 if (buildTable(*promotion.table, meta)) {
                     edit.addFile(0, meta);
+                    output_number = meta.number;
                 }
                 // The new log number retires logs covered by this flush.
                 edit.setLogNumber(promotion.log_number);
@@ -286,15 +345,30 @@ private:
                 {
                     std::lock_guard<std::mutex> guard(_manifest_mutex);
                     _versions.logAndApply(edit);
+                    if (output_number) {
+                        _pending_tables.erase(*output_number);
+                    }
                     removeObsoleteFiles();
                 }
 
                 // Publish the version before releasing the in-memory copy.
                 _memtables->dropImmutable();
                 error.clear();
+                requestCompaction();
                 break;
             } catch (const std::exception& e) {
                 error = e.what();
+                if (output_number) {
+                    std::lock_guard<std::mutex> guard(_manifest_mutex);
+                    if (!_versions.manifestFailed()) {
+                        _pending_tables.erase(*output_number);
+                        std::error_code ec;
+                        std::filesystem::remove(tableFileName(_options.dir, *output_number), ec);
+                    }
+                }
+                if (_versions.manifestFailed()) {
+                    break;
+                }
                 if (attempt < kFlushMaxAttempts) {
                     std::this_thread::sleep_for(kFlushRetryBackoff * attempt);
                 }
@@ -320,20 +394,247 @@ private:
 
         const uint64_t              number = _versions.newFileNumber();
         const std::filesystem::path path   = tableFileName(_options.dir, number);
-
-        SSTableBuilder builder(path, _options.sstable_block_size);
-        for (; it.valid(); it.next()) {
-            builder.add(it.key(), it.tag(), it.value());
+        {
+            std::lock_guard<std::mutex> guard(_manifest_mutex);
+            _pending_tables.insert(number);
         }
-        const uint64_t size = builder.finish();
-
-        meta.number       = number;
-        meta.file_size    = size;
-        meta.smallest_key = builder.smallestKey();
-        meta.smallest_tag = builder.smallestTag();
-        meta.largest_key  = builder.largestKey();
-        meta.largest_tag  = builder.largestTag();
+        try {
+            SSTableBuilder builder(path, _options.sstable_block_size);
+            for (; it.valid(); it.next()) {
+                builder.add(it.key(), it.tag(), it.value());
+            }
+            meta.number       = number;
+            meta.file_size    = builder.finish();
+            meta.smallest_key = builder.smallestKey();
+            meta.smallest_tag = builder.smallestTag();
+            meta.largest_key  = builder.largestKey();
+            meta.largest_tag  = builder.largestTag();
+        } catch (...) {
+            std::lock_guard<std::mutex> guard(_manifest_mutex);
+            _pending_tables.erase(number);
+            throw;
+        }
         return true;
+    }
+
+    void requestCompaction() {
+        {
+            std::lock_guard<std::mutex> guard(_compaction_mutex);
+            _compaction_requested = true;
+        }
+        _compaction_cv.notify_all();
+    }
+
+    void compactionWorker() {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(_compaction_mutex);
+                _compaction_cv.wait(lock, [this] {
+                    return _stop_compaction || _compaction_requested;
+                });
+                if (_stop_compaction) {
+                    return;
+                }
+                _compaction_requested = false;
+                _compaction_running = true;
+            }
+
+            std::string error;
+            for (size_t attempt = 1; attempt <= kFlushMaxAttempts; ++attempt) {
+                try {
+                    waitForPendingFlush();
+                    if (auto plan = _compaction_picker.pick(_versions.current())) {
+                        executeCompaction(*plan);
+                    }
+                    error.clear();
+                    break;
+                } catch (const std::exception& e) {
+                    error = e.what();
+                    if (_versions.manifestFailed() || attempt == kFlushMaxAttempts) {
+                        break;
+                    }
+                    std::this_thread::sleep_for(kFlushRetryBackoff * attempt);
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> guard(_compaction_mutex);
+                _compaction_error = std::move(error);
+                _compaction_running = false;
+                if (_compaction_error.empty() && _versions.current()->compactionScore() >= 1.0) {
+                    _compaction_requested = true;
+                }
+            }
+            _compaction_cv.notify_all();
+        }
+    }
+
+    [[nodiscard]] bool planStillCurrent(const CompactionPlan& plan) const {
+        const auto current = _versions.current();
+        const auto matches = [](const FileHandle& selected, const std::vector<FileHandle>& files) {
+            const auto found = std::find_if(files.begin(), files.end(), [&](const FileHandle& file) {
+                return file.meta.number == selected.meta.number;
+            });
+            return found != files.end() && found->meta.file_size == selected.meta.file_size &&
+                   found->meta.smallest_key == selected.meta.smallest_key &&
+                   found->meta.smallest_tag == selected.meta.smallest_tag &&
+                   found->meta.largest_key == selected.meta.largest_key &&
+                   found->meta.largest_tag == selected.meta.largest_tag;
+        };
+        for (const auto& file : plan.source) {
+            if (!matches(file, current->files(plan.source_level))) {
+                return false;
+            }
+        }
+        for (const auto& file : plan.destination) {
+            if (!matches(file, current->files(plan.source_level + 1))) {
+                return false;
+            }
+        }
+        const auto overlaps = current->overlappingInputs(plan.source_level + 1,
+                                                         plan.smallest_key, plan.largest_key);
+        return overlaps.size() == plan.destination.size();
+    }
+
+    void executeCompaction(CompactionPlan& plan) {
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<std::unique_ptr<InternalIterator>> children;
+        if (plan.source_level == 0) {
+            for (const auto& file : plan.source) {
+                children.push_back(std::make_unique<SSTableIterator>(file.table));
+            }
+        } else {
+            std::vector<std::shared_ptr<const SSTable>> tables;
+            for (const auto& file : plan.source) {
+                tables.push_back(file.table);
+            }
+            children.push_back(newConcatenatingIterator(std::move(tables)));
+        }
+        if (!plan.destination.empty()) {
+            std::vector<std::shared_ptr<const SSTable>> tables;
+            for (const auto& file : plan.destination) {
+                tables.push_back(file.table);
+            }
+            children.push_back(newConcatenatingIterator(std::move(tables)));
+        }
+        MergingIterator merge(std::move(children));
+
+        std::vector<uint64_t> numbers;
+        std::vector<FileMetaData> outputs;
+        std::unique_ptr<SSTableBuilder> builder;
+        uint64_t active_number = 0;
+        bool committed = false;
+
+        const auto startOutput = [&] {
+            active_number = _versions.newFileNumber();
+            {
+                std::lock_guard<std::mutex> guard(_manifest_mutex);
+                _pending_tables.insert(active_number);
+            }
+            numbers.push_back(active_number);
+            builder = std::make_unique<SSTableBuilder>(
+                tableFileName(_options.dir, active_number), _options.sstable_block_size);
+        };
+        const auto finishOutput = [&] {
+            FileMetaData meta;
+            meta.number = active_number;
+            meta.file_size = builder->finish();
+            meta.smallest_key = builder->smallestKey();
+            meta.smallest_tag = builder->smallestTag();
+            meta.largest_key = builder->largestKey();
+            meta.largest_tag = builder->largestTag();
+            outputs.push_back(std::move(meta));
+            builder.reset();
+        };
+
+        try {
+            std::string last_key;
+            uint64_t last_tag = 0;
+            bool have_last = false;
+            while (merge.valid()) {
+                const std::string_view key = merge.key();
+                const uint64_t tag = merge.tag();
+                if (have_last && key == last_key && tag == last_tag) {
+                    merge.next();
+                    continue;
+                }
+                if (builder && have_last && key != last_key &&
+                    builder->estimatedSize() >= _options.compaction_output_file_size) {
+                    finishOutput();
+                }
+                if (!builder) {
+                    startOutput();
+                }
+                builder->add(key, tag, merge.value());
+                last_key.assign(key);
+                last_tag = tag;
+                have_last = true;
+                merge.next();
+            }
+            if (builder) {
+                finishOutput();
+            }
+
+            VersionEdit edit;
+            for (const auto& file : plan.source) {
+                edit.deleteFile(plan.source_level, file.meta.number);
+            }
+            for (const auto& file : plan.destination) {
+                edit.deleteFile(plan.source_level + 1, file.meta.number);
+            }
+            for (const auto& meta : outputs) {
+                edit.addFile(plan.source_level + 1, meta);
+            }
+            {
+                std::lock_guard<std::mutex> guard(_manifest_mutex);
+                if (!planStillCurrent(plan)) {
+                    throw std::runtime_error("compaction inputs changed before commit");
+                }
+                _versions.logAndApply(edit);
+                committed = true;
+                for (const uint64_t number : numbers) {
+                    _pending_tables.erase(number);
+                }
+            }
+        } catch (...) {
+            builder.reset();
+            std::lock_guard<std::mutex> guard(_manifest_mutex);
+            if (!_versions.manifestFailed()) {
+                for (const uint64_t number : numbers) {
+                    _pending_tables.erase(number);
+                    std::error_code ec;
+                    std::filesystem::remove(tableFileName(_options.dir, number), ec);
+                }
+            }
+            throw;
+        }
+
+        if (committed) {
+            plan.base.reset();
+            std::lock_guard<std::mutex> guard(_manifest_mutex);
+            removeObsoleteFiles();
+        }
+
+        uint64_t input_bytes = 0;
+        for (const auto& file : plan.source) {
+            input_bytes += file.meta.file_size;
+        }
+        for (const auto& file : plan.destination) {
+            input_bytes += file.meta.file_size;
+        }
+        uint64_t output_bytes = 0;
+        for (const auto& meta : outputs) {
+            output_bytes += meta.file_size;
+        }
+        {
+            std::lock_guard<std::mutex> guard(_compaction_mutex);
+            _compaction_stats.input_bytes += input_bytes;
+            _compaction_stats.output_bytes += output_bytes;
+            _compaction_stats.input_files += plan.source.size() + plan.destination.size();
+            ++_compaction_stats.runs;
+            ++_compaction_stats.runs_by_level[static_cast<size_t>(plan.source_level)];
+            _compaction_stats.elapsed += std::chrono::steady_clock::now() - started;
+        }
     }
 
     // ── files ─────────────────────────────────────────────────────────────────
@@ -361,6 +662,9 @@ private:
 
     // Removes obsolete recognized files while holding _manifest_mutex.
     void removeObsoleteFiles() {
+        if (_versions.manifestFailed()) {
+            return;
+        }
         const std::set<uint64_t> live            = _versions.liveFiles();
         const uint64_t           log_number      = _versions.logNumber();
         const uint64_t           manifest_number = _versions.manifestNumber();
@@ -392,7 +696,7 @@ private:
             case FileType::kTable:
                 // Live means some Version still names it -- the current one, or
                 // an older one a reader has not let go of yet.
-                keep = live.contains(number);
+                keep = live.contains(number) || _pending_tables.contains(number);
                 break;
             case FileType::kTemp:
                 // Only ever a staging file for a CURRENT rename that did not
@@ -415,14 +719,27 @@ private:
     // Built during initialize(), once VersionSet can hand out file numbers.
     std::unique_ptr<Manager> _memtables;
 
+    mutable std::mutex _write_mutex;
+
     // Serializes manifest commits, which VersionSet requires to be
     // single-writer, and the obsolete-file sweep that reads the state they
     // install.
     std::mutex _manifest_mutex;
+    std::set<uint64_t> _pending_tables;
 
     std::mutex  _flush_mutex;
     std::thread _flush_thread;
 
     mutable std::mutex _error_mutex;
     std::string        _flush_error;
+
+    CompactionPicker _compaction_picker;
+    mutable std::mutex _compaction_mutex;
+    std::condition_variable _compaction_cv;
+    std::thread _compaction_thread;
+    bool _compaction_requested{ false };
+    bool _compaction_running{ false };
+    bool _stop_compaction{ false };
+    std::string _compaction_error;
+    CompactionStats _compaction_stats;
 };

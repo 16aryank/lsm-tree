@@ -235,6 +235,108 @@ int main() {
         }
     }
 
+    // Four overlapping flushes compact into level 1. The merge keeps old
+    // versions and tombstones, including versions visible to an old sequence.
+    {
+        const auto dir = caseDir(root, "compaction");
+        Options options = optionsFor(dir, 512);
+        options.compaction_output_file_size = 350;
+        uint64_t old_sequence = 0;
+        {
+            auto db = Engine::open(options);
+            std::shared_ptr<const Version> held_version;
+            std::vector<uint64_t> held_tables;
+            db->put("anchor", "first");
+            old_sequence = db->snapshot();
+            for (int round = 0; round < 5; ++round) {
+                db->put("anchor", "round-" + std::to_string(round));
+                db->put("doomed", "value");
+                db->del("doomed");
+                for (int i = 0; i < 40; ++i) {
+                    db->put(keyFor(i), valueFor(round * 40 + i));
+                }
+                db->waitForPendingFlush();
+                db->waitForPendingCompaction();
+                assert(db->lastFlushError().empty());
+                assert(db->lastCompactionError().empty());
+                if (round == 0) {
+                    held_version = db->currentVersion();
+                    for (int level = 0; level < kNumLevels; ++level) {
+                        for (const auto& file : held_version->files(level)) {
+                            held_tables.push_back(file.meta.number);
+                        }
+                    }
+                }
+            }
+            assert(!db->currentVersion()->files(1).empty());
+            assert(db->currentVersion()->files(1).size() > 1);
+            const auto stats = db->compactionStats();
+            assert(stats.runs > 0 && stats.runs_by_level[0] > 0);
+            assert(stats.input_bytes > 0 && stats.output_bytes > 0);
+            assert(got(*db, "anchor") == "round-4");
+            assert(*db->get("anchor", old_sequence) == "first");
+            assert(got(*db, "doomed") == ".");
+            for (int i = 0; i < 40; ++i) {
+                assert(got(*db, keyFor(i)) == valueFor(160 + i));
+            }
+            for (const uint64_t number : held_tables) {
+                assert(std::filesystem::exists(tableFileName(dir, number)));
+            }
+            held_version.reset();
+            for (int i = 40; i < 80; ++i) {
+                db->put(keyFor(i), valueFor(i));
+            }
+            db->waitForPendingCompaction();
+            for (const uint64_t number : held_tables) {
+                bool current = false;
+                for (int level = 0; level < kNumLevels; ++level) {
+                    for (const auto& file : db->currentVersion()->files(level)) {
+                        current |= file.meta.number == number;
+                    }
+                }
+                if (!current) {
+                    assert(!std::filesystem::exists(tableFileName(dir, number)));
+                }
+            }
+        }
+        {
+            auto db = Engine::open(options);
+            db->waitForPendingCompaction();
+            assert(db->lastCompactionError().empty());
+            assert(*db->get("anchor", old_sequence) == "first");
+            assert(got(*db, "anchor") == "round-4");
+            assert(got(*db, "doomed") == ".");
+        }
+    }
+
+    // The byte budget at level 1 also schedules a merge into level 2.
+    {
+        const auto dir = caseDir(root, "deeper-compaction");
+        Options options = optionsFor(dir, 1 << 19);
+        const std::string large_value(1 << 20, 'v');
+        {
+            auto db = Engine::open(options);
+            for (int i = 0; i < 16; ++i) {
+                db->put(keyFor(i), large_value);
+                db->waitForPendingFlush();
+            }
+            db->waitForPendingCompaction();
+            assert(db->lastFlushError().empty());
+            assert(db->lastCompactionError().empty());
+            assert(!db->currentVersion()->files(2).empty());
+            assert(db->compactionStats().runs_by_level[1] > 0);
+            for (int i = 0; i < 16; ++i) {
+                assert(got(*db, keyFor(i)) == large_value);
+            }
+        }
+        {
+            auto db = Engine::open(options);
+            for (int i = 0; i < 16; ++i) {
+                assert(got(*db, keyFor(i)) == large_value);
+            }
+        }
+    }
+
     // Opening uses the manifest's file set, ignoring and sweeping a stray SSTable.
     {
         const auto dir = caseDir(root, "stray");
@@ -421,6 +523,51 @@ int main() {
             for (int i = 0; i < kPerThread; ++i) {
                 assert(got(*reopened, concurrentKey(t, i)) == valueFor(i));
             }
+        }
+    }
+
+    // A snapshot captured while writers overwrite one key must keep returning
+    // the same value after flushes, compactions, and restart.
+    {
+        const auto dir = caseDir(root, "concurrent-snapshots");
+        const Options options = optionsFor(dir, 256);
+        auto db = Engine::open(options);
+        std::atomic<bool> writing{ true };
+        std::vector<std::pair<uint64_t, std::string>> observed;
+        std::thread sampler([&] {
+            while (writing.load() && observed.size() < 1000) {
+                const uint64_t sequence = db->snapshot();
+                const auto value = db->get("shared", sequence);
+                observed.emplace_back(sequence, value.value_or("."));
+                std::this_thread::yield();
+            }
+        });
+        std::vector<std::thread> writers;
+        for (int thread = 0; thread < 2; ++thread) {
+            writers.emplace_back([&, thread] {
+                for (int i = 0; i < 150; ++i) {
+                    db->put("shared", std::to_string(thread) + ":" + std::to_string(i) +
+                                       std::string(100, 'x'));
+                }
+            });
+        }
+        for (auto& writer : writers) {
+            writer.join();
+        }
+        writing.store(false);
+        sampler.join();
+        observed.emplace_back(db->snapshot(), got(*db, "shared"));
+        db->waitForPendingCompaction();
+        assert(db->lastFlushError().empty());
+        assert(db->lastCompactionError().empty());
+        for (const auto& [sequence, value] : observed) {
+            assert(db->get("shared", sequence).value_or(".") == value);
+        }
+        db.reset();
+        auto reopened = Engine::open(options);
+        reopened->waitForPendingCompaction();
+        for (const auto& [sequence, value] : observed) {
+            assert(reopened->get("shared", sequence).value_or(".") == value);
         }
     }
 

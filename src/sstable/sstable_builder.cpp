@@ -12,7 +12,7 @@
 SSTableBuilder::SSTableBuilder(std::filesystem::path path, size_t block_size)
     : _path(std::move(path)), _fd(-1), _block_size(block_size) {
     assert(block_size > 0);
-    _fd = ::open(_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    _fd = ::open(_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (_fd < 0) {
         throw std::system_error(errno, std::generic_category(),
                                 "SSTable create: " + _path.string());

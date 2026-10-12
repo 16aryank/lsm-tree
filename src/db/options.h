@@ -18,6 +18,9 @@ struct Options {
     // Data block size for tables written by a flush or a compaction.
     size_t sstable_block_size = kSSTableBlockSize;
 
+    // Target size for a compaction output. A single key is never split.
+    uint64_t compaction_output_file_size = 2ull << 20;
+
     // Threshold for writing a fresh manifest snapshot.
     uint64_t max_manifest_file_size = kDefaultMaxManifestFileSize;
 

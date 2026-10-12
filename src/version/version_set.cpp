@@ -45,6 +45,12 @@ VersionSet::~VersionSet() {
     closeManifest();
 }
 
+void VersionSet::advanceFileNumberPast(uint64_t number) noexcept {
+    uint64_t next = _next_file_number.load();
+    while (next <= number &&
+           !_next_file_number.compare_exchange_weak(next, number + 1)) { }
+}
+
 void VersionSet::closeManifest() noexcept {
     _manifest_log.reset();
     if (_manifest_fd >= 0) {
@@ -138,6 +144,7 @@ void VersionSet::createNew() {
     _next_file_number.store(1);
     _last_sequence.store(0);
     _log_number.store(0);
+    _manifest_failed = false;
 
     VersionBuilder builder(_dir, nullptr);
     std::shared_ptr<const Version> empty = builder.build();
@@ -222,9 +229,13 @@ void VersionSet::recover() {
     boost::unique_lock<boost::shared_mutex> lock(_mutex);
     _current = recovered;
     trackVersion(recovered);
+    _manifest_failed = false;
 }
 
 void VersionSet::logAndApply(VersionEdit& edit) {
+    if (_manifest_failed) {
+        throw std::runtime_error("manifest needs recovery after a failed append");
+    }
     if (!edit.hasLogNumber()) {
         edit.setLogNumber(_log_number.load());
     }
@@ -244,10 +255,14 @@ void VersionSet::logAndApply(VersionEdit& edit) {
         installNewManifest(*next, log_number);
     } else {
         const std::string record = edit.encode();
-        _manifest_log->addRecord(byteSpan(record));
-        // Durable before the version is installed, so a reader can never
-        // observe a file set that a crash would take back.
-        _manifest_log->sync();
+        try {
+            _manifest_log->addRecord(byteSpan(record));
+            // Durable before the version is installed.
+            _manifest_log->sync();
+        } catch (...) {
+            _manifest_failed = true;
+            throw;
+        }
     }
 
     boost::unique_lock<boost::shared_mutex> lock(_mutex);

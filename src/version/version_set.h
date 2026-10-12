@@ -52,6 +52,7 @@ public:
     // Reserves a unique file number.
     [[nodiscard]] uint64_t newFileNumber() noexcept { return _next_file_number.fetch_add(1); }
     [[nodiscard]] uint64_t nextFileNumber() const noexcept { return _next_file_number.load(); }
+    void advanceFileNumberPast(uint64_t number) noexcept;
 
     [[nodiscard]] uint64_t lastSequence() const noexcept { return _last_sequence.load(); }
     void setLastSequence(uint64_t sequence) noexcept { _last_sequence.store(sequence); }
@@ -63,6 +64,7 @@ public:
     [[nodiscard]] uint64_t logNumber() const noexcept { return _log_number.load(); }
 
     [[nodiscard]] uint64_t manifestNumber() const noexcept { return _manifest_number.load(); }
+    [[nodiscard]] bool manifestFailed() const noexcept { return _manifest_failed; }
 
     // Every file number referenced by any Version still alive -- the current
     // one and any older one a reader is still holding. Anything else in the
@@ -92,6 +94,7 @@ private:
 
     int                        _manifest_fd{ -1 };
     std::unique_ptr<WalWriter> _manifest_log;
+    std::atomic<bool> _manifest_failed{ false };
 
     mutable boost::shared_mutex    _mutex;
     std::shared_ptr<const Version> _current;

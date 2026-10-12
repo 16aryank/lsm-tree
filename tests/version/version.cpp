@@ -11,6 +11,7 @@
 #include "src/key.h"
 #include "src/sstable/sstable_builder.h"
 #include "src/version/version.h"
+#include "src/version/compaction.h"
 
 #include <algorithm>
 #include <cassert>
@@ -353,6 +354,105 @@ int main() {
 
         // The bottom level is never chosen: there is nowhere below it to go.
         assert(version->compactionLevel() < kNumLevels - 1);
+
+        CompactionPicker picker;
+        const auto plan = picker.pick(version);
+        assert(plan.has_value());
+        assert(plan->source_level == 0);
+        assert(plan->source.size() == kL0CompactionTrigger);
+        assert(plan->destination.empty());
+        assert(plan->smallest_key == "k0" && plan->largest_key == "k3");
+        assert(!picker.pick(under).has_value());
+    }
+
+    // Sorted levels reject shared boundary keys and inconsistent metadata
+    // before an edit can be appended to the manifest.
+    {
+        const auto first = writeTable(dir, 90, {
+            { "a", 1, ValueType::kValue, "A" },
+            { "c", 1, ValueType::kValue, "C" },
+        });
+        const auto touching = writeTable(dir, 91, {
+            { "c", 2, ValueType::kValue, "new C" },
+            { "d", 2, ValueType::kValue, "D" },
+        });
+        VersionEdit overlap;
+        overlap.addFile(1, first);
+        overlap.addFile(1, touching);
+        bool rejected = false;
+        try { (void)buildFrom(dir, nullptr, overlap); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+
+        VersionEdit duplicate_number;
+        duplicate_number.addFile(0, first);
+        duplicate_number.addFile(2, first);
+        rejected = false;
+        try { (void)buildFrom(dir, nullptr, duplicate_number); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+
+        VersionEdit wrong_size;
+        auto incorrect = first;
+        ++incorrect.file_size;
+        wrong_size.addFile(1, incorrect);
+        rejected = false;
+        try { (void)buildFrom(dir, nullptr, wrong_size); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+
+    // Picking one level-1 file can pull in a level-2 file, which expands the
+    // range into another level-1 file. Selection continues to a fixed point.
+    {
+        VersionEdit edit;
+        edit.addFile(1, writeTable(dir, 110, {
+            { "b", 1, ValueType::kValue, "b" },
+            { "c", 1, ValueType::kValue, "c" },
+        }));
+        edit.addFile(1, writeTable(dir, 111, {
+            { "h", 1, ValueType::kValue, "h" },
+            { "j", 1, ValueType::kValue, "j" },
+        }));
+        edit.addFile(1, writeTable(dir, 112, {
+            { "p", 1, ValueType::kValue, "p" },
+            { "r", 1, ValueType::kValue, "r" },
+        }));
+        edit.addFile(2, writeTable(dir, 120, {
+            { "a", 1, ValueType::kValue, "a" },
+            { "b", 1, ValueType::kValue, "b" },
+        }));
+        edit.addFile(2, writeTable(dir, 121, {
+            { "c", 1, ValueType::kValue, "c" },
+            { "i", 1, ValueType::kValue, "i" },
+        }));
+        edit.addFile(2, writeTable(dir, 122, {
+            { "j", 1, ValueType::kValue, "j" },
+            { "q", 1, ValueType::kValue, "q" },
+        }));
+        const auto version = buildFrom(dir, nullptr, edit);
+        CompactionPicker picker;
+        const auto plan = picker.pickAtLevel(version, 1);
+        assert(plan && plan->source.size() == 3 && plan->destination.size() == 3);
+        assert(plan->smallest_key == "a" && plan->largest_key == "r");
+        assert(!picker.pickAtLevel(version, 6));
+    }
+
+    // Without destination overlaps, successive picks rotate through files.
+    {
+        VersionEdit edit;
+        for (uint64_t n = 130; n < 133; ++n) {
+            edit.addFile(1, writeTable(dir, n, {
+                { "k" + std::to_string(n), 1, ValueType::kValue, "v" },
+            }));
+        }
+        const auto version = buildFrom(dir, nullptr, edit);
+        CompactionPicker picker;
+        for (uint64_t expected : { 130, 131, 132, 130 }) {
+            const auto plan = picker.pickAtLevel(version, 1);
+            assert(plan && plan->source.size() == 1);
+            assert(plan->source[0].meta.number == expected);
+        }
     }
 
     // Level budgets grow by ten per level, which is what bounds the tree's
