@@ -55,6 +55,9 @@ private:
     // Slow path: block exhausted (or none mapped yet). Takes _blocks_mutex.
     char* allocateFallback(size_t bytes);
 
+    // Attempts to reserve space in a block; returns null if it cannot fit.
+    char* tryAllocate(Block* block, size_t bytes);
+
     // Maps a new block of at least `capacity` bytes and records it for
     // teardown. Caller must hold _blocks_mutex.
     Block* addBlock(size_t capacity);

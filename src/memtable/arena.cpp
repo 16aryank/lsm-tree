@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <limits>
 #include <new>
 
 namespace {
@@ -17,9 +18,17 @@ size_t pageSize() {
     return kPageSize;
 }
 
-// Rounds `n` up to a multiple of `to`, which must be a power of two.
-constexpr size_t roundUp(size_t n, size_t to) noexcept {
-    return (n + to - 1) & ~(to - 1);
+// Rounds `n` up to a multiple of nonzero `to` without wrapping size_t.
+size_t roundUp(size_t n, size_t to) {
+    const size_t remainder = n % to;
+    if (remainder == 0) {
+        return n;
+    }
+    const size_t padding = to - remainder;
+    if (n > std::numeric_limits<size_t>::max() - padding) {
+        throw std::bad_alloc();
+    }
+    return n + padding;
 }
 
 } // namespace
@@ -45,25 +54,8 @@ char* Arena::allocate(size_t bytes) {
         bytes = 1;
     }
 
-    Block* block = _current.load(std::memory_order_acquire);
-    if (block != nullptr) {
-        size_t offset = block->offset.load(std::memory_order_relaxed);
-        for (;;) {
-            const size_t aligned = roundUp(offset, kArenaAlignment);
-            // Written as a subtraction so `bytes` can't overflow
-            // Need to check this after every failed CAS because another thread
-            // may filled capacity of the block
-            if (aligned > block->capacity || bytes > block->capacity - aligned) {
-                break; // need to map a fresh block
-            }
-            // updates `offset` on success
-            if (block->offset.compare_exchange_weak(offset, aligned + bytes,
-                                                    std::memory_order_acq_rel,
-                                                    std::memory_order_relaxed)) {
-                _bytes_allocated.fetch_add(bytes, std::memory_order_relaxed);
-                return block->base + aligned;
-            }
-        }
+    if (char* result = tryAllocate(_current.load(std::memory_order_acquire), bytes)) {
+        return result;
     }
 
     return allocateFallback(bytes);
@@ -74,21 +66,8 @@ char* Arena::allocateFallback(size_t bytes) {
 
     // Another thread may have mapped a fresh block while we waited for the
     // lock, so retry the fast path before mapping one of our own.
-    Block* block = _current.load(std::memory_order_acquire);
-    if (block != nullptr) {
-        size_t offset = block->offset.load(std::memory_order_relaxed);
-        for (;;) {
-            const size_t aligned = roundUp(offset, kArenaAlignment);
-            if (aligned > block->capacity || bytes > block->capacity - aligned) {
-                break;
-            }
-            if (block->offset.compare_exchange_weak(offset, aligned + bytes,
-                                                    std::memory_order_acq_rel,
-                                                    std::memory_order_relaxed)) {
-                _bytes_allocated.fetch_add(bytes, std::memory_order_relaxed);
-                return block->base + aligned;
-            }
-        }
+    if (char* result = tryAllocate(_current.load(std::memory_order_acquire), bytes)) {
+        return result;
     }
 
     // A request large relative to the block size gets its own right-sized
@@ -103,7 +82,9 @@ char* Arena::allocateFallback(size_t bytes) {
     }
 
     Block* fresh = addBlock(_next_block_bytes);
-    _next_block_bytes = std::min(_next_block_bytes * 2, kArenaMaxBlockBytes);
+    _next_block_bytes = _next_block_bytes >= kArenaMaxBlockBytes / 2
+                            ? kArenaMaxBlockBytes
+                            : _next_block_bytes * 2;
 
     // Take our slice before publishing, so the block is never visible to
     // another thread in a state where this allocation hasn't been reserved.
@@ -111,6 +92,28 @@ char* Arena::allocateFallback(size_t bytes) {
     _current.store(fresh, std::memory_order_release);
     _bytes_allocated.fetch_add(bytes, std::memory_order_relaxed);
     return fresh->base;
+}
+
+char* Arena::tryAllocate(Block* block, size_t bytes) {
+    if (block == nullptr) {
+        return nullptr;
+    }
+
+    size_t offset = block->offset.load(std::memory_order_relaxed);
+    for (;;) {
+        const size_t aligned = roundUp(offset, kArenaAlignment);
+        // Recheck after a failed CAS: another thread may have filled the block.
+        // Subtraction avoids overflowing when the requested size is large.
+        if (aligned > block->capacity || bytes > block->capacity - aligned) {
+            return nullptr;
+        }
+        if (block->offset.compare_exchange_weak(offset, aligned + bytes,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_relaxed)) {
+            _bytes_allocated.fetch_add(bytes, std::memory_order_relaxed);
+            return block->base + aligned;
+        }
+    }
 }
 
 Arena::Block* Arena::addBlock(size_t capacity) {
@@ -122,12 +125,17 @@ Arena::Block* Arena::addBlock(size_t capacity) {
         throw std::bad_alloc();
     }
 
-    auto block = std::make_unique<Block>();
-    block->base = static_cast<char*>(address);
-    block->capacity = mapped;
+    try {
+        auto block = std::make_unique<Block>();
+        block->base = static_cast<char*>(address);
+        block->capacity = mapped;
 
-    Block* raw = block.get();
-    _blocks.push_back(std::move(block));
-    _bytes_reserved.fetch_add(mapped, std::memory_order_relaxed);
-    return raw;
+        Block* raw = block.get();
+        _blocks.push_back(std::move(block));
+        _bytes_reserved.fetch_add(mapped, std::memory_order_relaxed);
+        return raw;
+    } catch (...) {
+        ::munmap(address, mapped);
+        throw;
+    }
 }

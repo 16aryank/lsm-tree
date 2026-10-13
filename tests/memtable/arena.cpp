@@ -9,6 +9,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -126,6 +128,29 @@ void testOversizedAllocation() {
     assert(arena.bytesReserved() >= kBig);
 }
 
+// A size that cannot be rounded up to a page must fail without mapping a
+// wrapped, undersized region. The arena remains usable afterward.
+void testSizeOverflow() {
+    Arena arena;
+    try {
+        arena.allocate(std::numeric_limits<size_t>::max());
+        assert(false);
+    } catch (const std::bad_alloc&) {
+    }
+    assert(arena.bytesAllocated() == 0);
+    assert(arena.bytesReserved() == 0);
+
+    char* p = arena.allocate(1);
+    assert(p != nullptr);
+    try {
+        arena.allocate(std::numeric_limits<size_t>::max());
+        assert(false);
+    } catch (const std::bad_alloc&) {
+    }
+    assert(arena.bytesAllocated() == 1);
+    assert(arena.bytesReserved() >= pageSize());
+}
+
 // Concurrent allocate() must never hand the same bytes to two threads. Each
 // thread stamps its regions with its own id; if any two regions overlapped,
 // one thread's stamp would be clobbered by the other's.
@@ -184,6 +209,7 @@ int main() {
     testZeroSized();
     testBlockGrowth();
     testOversizedAllocation();
+    testSizeOverflow();
     testConcurrentNonOverlap();
     return 0;
 }
