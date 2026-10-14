@@ -7,6 +7,7 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -60,9 +61,60 @@ struct CompactionStats {
 template <typename UserKey_, typename Value_>
     requires ByteStorable<UserKey_> && ByteStorable<Value_>
 class DB {
+    struct SnapshotRegistry {
+        std::mutex mutex;
+        std::map<uint64_t, size_t> active;
+    };
+
 public:
     using Manager = MemTableManager<UserKey_, Value_>;
     using Table   = MemTable<UserKey_, Value_>;
+
+    // A registered read sequence. Releasing the last handle for a sequence
+    // lets later compactions discard versions it alone needed.
+    class Snapshot {
+    public:
+        Snapshot() = default;
+        Snapshot(const Snapshot&) = delete;
+        Snapshot& operator=(const Snapshot&) = delete;
+
+        Snapshot(Snapshot&& other) noexcept
+            : _registry(std::move(other._registry)), _sequence(other._sequence) { }
+
+        Snapshot& operator=(Snapshot&& other) noexcept {
+            if (this != &other) {
+                reset();
+                _registry = std::move(other._registry);
+                _sequence = other._sequence;
+            }
+            return *this;
+        }
+
+        ~Snapshot() { reset(); }
+
+        [[nodiscard]] uint64_t sequence() const noexcept { return _sequence; }
+        [[nodiscard]] bool valid() const noexcept { return static_cast<bool>(_registry); }
+
+        void reset() noexcept {
+            if (!_registry) {
+                return;
+            }
+            auto registry = std::move(_registry);
+            std::lock_guard<std::mutex> guard(registry->mutex);
+            auto it = registry->active.find(_sequence);
+            if (--it->second == 0) {
+                registry->active.erase(it);
+            }
+        }
+
+    private:
+        friend class DB;
+        Snapshot(std::shared_ptr<SnapshotRegistry> registry, uint64_t sequence)
+            : _registry(std::move(registry)), _sequence(sequence) { }
+
+        std::shared_ptr<SnapshotRegistry> _registry;
+        uint64_t _sequence = 0;
+    };
 
     // Opens or creates the database described by `options`. Throws if the
     // directory holds no database and create_if_missing is false, if it holds
@@ -110,36 +162,25 @@ public:
     // Reads at the newest sequence number, i.e. sees every write that has
     // returned.
     [[nodiscard]] std::optional<Value_> get(const UserKey_& key) const {
-        return get(key, _versions.lastSequence());
+        const Snapshot read = snapshot();
+        return getAtSequence(key, read.sequence());
     }
 
-    // Reads as of `snapshot`, seeing no write numbered above it.
-    [[nodiscard]] std::optional<Value_> get(const UserKey_& key, uint64_t snapshot) const {
-        Value_ value;
-        switch (_memtables->lookup(key, snapshot, value)) {
-        case LookupStatus::kFound:
-            return value;
-        case LookupStatus::kDeleted:
-            // A tombstone masks older versions on disk.
-            return std::nullopt;
-        case LookupStatus::kNotFound:
-            break;
+    // A handle from another DB instance, or one already released, is invalid.
+    [[nodiscard]] std::optional<Value_> get(const UserKey_& key,
+                                              const Snapshot& snapshot) const {
+        if (!snapshot._registry || snapshot._registry != _snapshots) {
+            throw std::invalid_argument("snapshot is not active for this DB");
         }
-
-        const std::shared_ptr<const Version> version = _versions.current();
-        const std::optional<SSTable::Entry>  entry =
-            version->get(std::string_view(key.data(), key.size()), snapshot);
-        if (!entry || entry->type == ValueType::kDelete) {
-            return std::nullopt;
-        }
-        return Value_(entry->value.data(), entry->value.size());
+        return getAtSequence(key, snapshot.sequence());
     }
 
-    // A sequence number to read at later, so a series of get()s can see one
-    // consistent state regardless of what is written in between.
-    [[nodiscard]] uint64_t snapshot() const {
-        std::lock_guard<std::mutex> guard(_write_mutex);
-        return _versions.lastSequence();
+    [[nodiscard]] Snapshot snapshot() const {
+        std::lock_guard<std::mutex> write_guard(_write_mutex);
+        const uint64_t sequence = _versions.lastSequence();
+        std::lock_guard<std::mutex> snapshot_guard(_snapshots->mutex);
+        ++_snapshots->active[sequence];
+        return Snapshot(_snapshots, sequence);
     }
 
     // Test and shutdown helper: blocks until any in-flight flush finishes. A
@@ -184,6 +225,27 @@ public:
     }
 
 private:
+    [[nodiscard]] std::optional<Value_> getAtSequence(const UserKey_& key,
+                                                       uint64_t sequence) const {
+        Value_ value;
+        switch (_memtables->lookup(key, sequence, value)) {
+        case LookupStatus::kFound:
+            return value;
+        case LookupStatus::kDeleted:
+            // A tombstone masks older versions on disk.
+            return std::nullopt;
+        case LookupStatus::kNotFound:
+            break;
+        }
+
+        const std::shared_ptr<const Version> version = _versions.current();
+        const std::optional<SSTable::Entry>  entry =
+            version->get(std::string_view(key.data(), key.size()), sequence);
+        if (!entry || entry->type == ValueType::kDelete) {
+            return std::nullopt;
+        }
+        return Value_(entry->value.data(), entry->value.size());
+    }
     explicit DB(Options options)
         : _options(std::move(options)),
           _versions(_options.dir, _options.max_manifest_file_size) { }
@@ -496,8 +558,31 @@ private:
         return overlaps.size() == plan.destination.size();
     }
 
+    [[nodiscard]] uint64_t compactionCutoff() const {
+        std::lock_guard<std::mutex> write_guard(_write_mutex);
+        std::lock_guard<std::mutex> snapshot_guard(_snapshots->mutex);
+        return _snapshots->active.empty() ? _versions.lastSequence()
+                                          : _snapshots->active.begin()->first;
+    }
+
+    [[nodiscard]] static bool mayContainBelow(const Version& version, int output_level,
+                                               std::string_view key) {
+        for (int level = output_level + 1; level < kNumLevels; ++level) {
+            const auto& files = version.files(level);
+            const auto file = std::partition_point(files.begin(), files.end(),
+                                                   [key](const FileHandle& candidate) {
+                return candidate.meta.largest_key < key;
+            });
+            if (file != files.end() && file->meta.smallest_key <= key) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void executeCompaction(CompactionPlan& plan) {
         const auto started = std::chrono::steady_clock::now();
+        const uint64_t cutoff = compactionCutoff();
         std::vector<std::unique_ptr<InternalIterator>> children;
         if (plan.source_level == 0) {
             for (const auto& file : plan.source) {
@@ -548,17 +633,39 @@ private:
         };
 
         try {
-            std::string last_key;
-            uint64_t last_tag = 0;
-            bool have_last = false;
+            std::string input_key;
+            std::string output_key;
+            uint64_t input_tag = 0;
+            bool have_input = false;
+            bool retained_at_cutoff = false;
+            bool deeper_overlap = false;
             while (merge.valid()) {
                 const std::string_view key = merge.key();
                 const uint64_t tag = merge.tag();
-                if (have_last && key == last_key && tag == last_tag) {
+                const bool new_key = !have_input || key != input_key;
+                if (new_key) {
+                    retained_at_cutoff = false;
+                    deeper_overlap = mayContainBelow(*plan.base, plan.source_level + 1, key);
+                }
+                const bool duplicate = have_input && !new_key && tag == input_tag;
+                input_key.assign(key);
+                input_tag = tag;
+                have_input = true;
+                if (duplicate) {
                     merge.next();
                     continue;
                 }
-                if (builder && have_last && key != last_key &&
+
+                bool retain = unpackSeqNumber(tag) > cutoff;
+                if (!retain && !retained_at_cutoff) {
+                    retained_at_cutoff = true;
+                    retain = unpackValueType(tag) != ValueType::kDelete || deeper_overlap;
+                }
+                if (!retain) {
+                    merge.next();
+                    continue;
+                }
+                if (builder && key != output_key &&
                     builder->estimatedSize() >= _options.compaction_output_file_size) {
                     finishOutput();
                 }
@@ -566,9 +673,7 @@ private:
                     startOutput();
                 }
                 builder->add(key, tag, merge.value());
-                last_key.assign(key);
-                last_tag = tag;
-                have_last = true;
+                output_key.assign(key);
                 merge.next();
             }
             if (builder) {
@@ -720,6 +825,7 @@ private:
     std::unique_ptr<Manager> _memtables;
 
     mutable std::mutex _write_mutex;
+    std::shared_ptr<SnapshotRegistry> _snapshots = std::make_shared<SnapshotRegistry>();
 
     // Serializes manifest commits, which VersionSet requires to be
     // single-writer, and the obsolete-file sweep that reads the state they

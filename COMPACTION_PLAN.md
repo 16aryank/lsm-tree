@@ -2,21 +2,21 @@
 
 ## Status
 
-Steps 0–5 are implemented as merge-only compaction. The picker, background worker, bounded retries, output splitting, pending-file protection, manifest failure guard, and worker metrics are in place. Tests cover level-0 and level-1 selection, level-0-to-1 and level-1-to-2 compaction, historical reads, restart, and an older pinned `Version` through cleanup. Fault-injection tests for output and manifest I/O failures remain open. Step 6 is a separate API change: sequence-number snapshots are still unrestricted, so compaction retains historical entries and tombstones.
+Steps 0–6 are implemented. The picker, background worker, bounded retries, output splitting, pending-file protection, manifest failure guard, worker metrics, registered snapshots, and reclamation rules are in place. Tests cover level-0 and level-1 selection, level-0-to-1 and level-1-to-2 compaction, snapshots across compactions, snapshot release, both tombstone rules, restart, and an older pinned `Version` through cleanup. Fault-injection tests for output and manifest I/O failures remain open.
 
 ## Goal and current starting point
 
 Move flushed SSTables from level 0 through levels 1–6, keeping point reads correct while reducing the number of files they inspect. The implementation uses immutable `Version`s, `VersionEdit` file additions and deletions, level scores, overlap queries, sorted iterators, and `SSTableBuilder`.
 
-The first milestone **merges files without discarding historical versions or tombstones**. `DB::snapshot()` returns an unrestricted sequence number, and `get(key, sequence)` accepts that number indefinitely. Dropping an old entry under the current API could change a later historical read. Reclamation needs an explicit snapshot retention contract; that is a separate milestone below.
+The first milestone merged files without discarding historical versions or tombstones. The next milestone replaced unrestricted sequence-number reads with registered snapshot handles, allowing compaction to reclaim entries once no active reader needs them.
 
 ## 0. Make write order match sequence order
 
-`DB::write()` currently reserves a sequence number before entering `MemTableManager::add()`. Concurrent writers can insert out of order, including across a memtable rotation. A newer SSTable could then contain an older sequence than a file below it, while level-0 reads assume newer file numbers win. `snapshot()` can also observe a reserved sequence before its write has landed.
+Before step 0, `DB::write()` reserved a sequence number before entering `MemTableManager::add()`. Concurrent writers could insert out of order, including across a memtable rotation. A newer SSTable could then contain an older sequence than a file below it, while level-0 reads assume newer file numbers win. `snapshot()` could also observe a reserved sequence before its write had landed.
 
 For the first implementation, serialize sequence assignment through WAL append and memtable insertion with a DB write mutex. Take that mutex when creating a snapshot so it captures a completed prefix of writes. A later optimization can replace serialization with a committed-sequence watermark and explicit handling of in-flight writes.
 
-**Acceptance:** two writers repeatedly overwrite the same key while flushes occur; reads at the latest sequence and at a captured snapshot agree with sequence order before and after restart.
+**Acceptance:** two writers repeatedly overwrite the same key while flushes occur; captured snapshots remain stable during the DB instance's lifetime, and the latest value survives restart.
 
 ## 1. Define and validate level invariants
 
@@ -64,9 +64,9 @@ For the first implementation, serialize sequence assignment through WAL append a
 
 ## 6. Reclaim obsolete versions safely
 
-The merge-only milestone reduces file count and read amplification, but retains old values and tombstones. To reclaim them, introduce registered, lifetime-bound RAII snapshot handles and make `get(key, SnapshotHandle)` the public historical-read API. Move `get(key, uint64_t)` behind an internal interface or reject unregistered sequences explicitly. This is an API change: unrestricted historical reads and version reclamation cannot both be guaranteed. Snapshot registration and the compaction cutoff must use the completed-write sequence established in step 0.
+The merge-only milestone reduced file count and read amplification while retaining old values and tombstones. `DB::snapshot()` now returns a registered, move-only RAII handle, and `get(key, Snapshot)` is the public historical-read API. Raw sequence-number reads are private. This is an API change: unrestricted historical reads and version reclamation cannot both be guaranteed. Snapshot registration and the compaction cutoff use the completed-write sequence established in step 0.
 
-With that contract in place, retain all versions newer than the oldest active snapshot and the first version at or below it for each user key; drop older versions. A tombstone at or below the cutoff can be dropped only when no deeper level can contain a value it must mask. Use user-key range checks against levels below the output level for that decision. Treat the absence of active snapshots as a cutoff at the current sequence number. Add tests for snapshots held across several compactions, deletes above and below the cutoff, deeper-level values, snapshot release, and restart.
+Compaction retains all versions newer than the oldest active snapshot and the first version at or below it for each user key; it drops older versions. A tombstone at or below the cutoff is dropped only when no deeper level can contain a value it must mask. User-key range checks against levels below the output level make that decision conservatively. The absence of active snapshots sets the cutoff to the completed current sequence. Snapshot release enables reclamation during a later compaction; it does not trigger an immediate rewrite.
 
 ## Suggested implementation order
 

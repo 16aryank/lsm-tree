@@ -1,6 +1,8 @@
 // End-to-end writes, flushes, restarts, and manifest-based recovery.
 #include "src/db/db.h"
 #include "src/db/filename.h"
+#include "src/sstable/sstable_builder.h"
+#include "src/version/version_set.h"
 
 #include <atomic>
 #include <cassert>
@@ -62,6 +64,24 @@ std::vector<uint64_t> filesOfType(const std::filesystem::path& dir, FileType wan
     return numbers;
 }
 
+size_t entriesForKey(const Version& version, std::string_view key, int level = -1) {
+    size_t count = 0;
+    for (int current = 0; current < kNumLevels; ++current) {
+        if (level >= 0 && current != level) {
+            continue;
+        }
+        for (const auto& file : version.files(current)) {
+            auto it = file.table->cursor();
+            it.seek(key, UINT64_MAX);
+            while (it.valid() && it.key() == key) {
+                ++count;
+                it.next();
+            }
+        }
+    }
+    return count;
+}
+
 bool threw(auto&& fn) {
     try {
         fn();
@@ -111,12 +131,14 @@ int main() {
         auto db = Engine::open(optionsFor(dir));
 
         db->put("k", "first");
-        const uint64_t snapshot = db->snapshot();
+        const auto snapshot = db->snapshot();
         db->put("k", "second");
         db->put("fresh", "new");
 
         assert(got(*db, "k") == "second");
         assert(*db->get("k", snapshot) == "first");
+        Engine::Snapshot invalid;
+        assert(threw([&] { (void)db->get("k", invalid); }));
         // A key written after the snapshot is invisible to it.
         assert(!db->get("fresh", snapshot).has_value());
 
@@ -235,19 +257,18 @@ int main() {
         }
     }
 
-    // Four overlapping flushes compact into level 1. The merge keeps old
-    // versions and tombstones, including versions visible to an old sequence.
+    // Four overlapping flushes compact into level 1. A live snapshot keeps
+    // the old anchor version available across those merges.
     {
         const auto dir = caseDir(root, "compaction");
         Options options = optionsFor(dir, 512);
         options.compaction_output_file_size = 350;
-        uint64_t old_sequence = 0;
         {
             auto db = Engine::open(options);
             std::shared_ptr<const Version> held_version;
             std::vector<uint64_t> held_tables;
             db->put("anchor", "first");
-            old_sequence = db->snapshot();
+            auto old_snapshot = db->snapshot();
             for (int round = 0; round < 5; ++round) {
                 db->put("anchor", "round-" + std::to_string(round));
                 db->put("doomed", "value");
@@ -274,7 +295,7 @@ int main() {
             assert(stats.runs > 0 && stats.runs_by_level[0] > 0);
             assert(stats.input_bytes > 0 && stats.output_bytes > 0);
             assert(got(*db, "anchor") == "round-4");
-            assert(*db->get("anchor", old_sequence) == "first");
+            assert(*db->get("anchor", old_snapshot) == "first");
             assert(got(*db, "doomed") == ".");
             for (int i = 0; i < 40; ++i) {
                 assert(got(*db, keyFor(i)) == valueFor(160 + i));
@@ -283,6 +304,7 @@ int main() {
                 assert(std::filesystem::exists(tableFileName(dir, number)));
             }
             held_version.reset();
+            old_snapshot.reset();
             for (int i = 40; i < 80; ++i) {
                 db->put(keyFor(i), valueFor(i));
             }
@@ -303,9 +325,93 @@ int main() {
             auto db = Engine::open(options);
             db->waitForPendingCompaction();
             assert(db->lastCompactionError().empty());
-            assert(*db->get("anchor", old_sequence) == "first");
             assert(got(*db, "anchor") == "round-4");
             assert(got(*db, "doomed") == ".");
+        }
+    }
+
+    // The oldest live snapshot sets the cutoff. Releasing it advances the
+    // cutoff to the next snapshot; releasing both permits full reclamation.
+    {
+        const auto dir = caseDir(root, "version-reclamation");
+        const Options options = optionsFor(dir, 64);
+        {
+            auto db = Engine::open(options);
+            db->put("k", std::string(100, 'a'));
+            db->waitForPendingFlush();
+            auto held = db->snapshot();
+            Engine::Snapshot newer;
+            for (char c : { 'b', 'c', 'd' }) {
+                db->put("k", std::string(100, c));
+                db->waitForPendingFlush();
+                if (c == 'b') {
+                    newer = db->snapshot();
+                }
+            }
+            db->waitForPendingCompaction();
+            assert(db->lastCompactionError().empty());
+            assert(entriesForKey(*db->currentVersion(), "k") == 4);
+            assert(*db->get("k", held) == std::string(100, 'a'));
+
+            held.reset();
+            assert(threw([&] { (void)db->get("k", held); }));
+            for (char c : { 'e', 'f', 'g', 'h' }) {
+                db->put("k", std::string(100, c));
+                db->waitForPendingFlush();
+            }
+            db->waitForPendingCompaction();
+            assert(db->lastCompactionError().empty());
+            assert(entriesForKey(*db->currentVersion(), "k") == 7);
+            assert(*db->get("k", newer) == std::string(100, 'b'));
+            newer.reset();
+            for (char c : { 'i', 'j', 'k', 'l' }) {
+                db->put("k", std::string(100, c));
+                db->waitForPendingFlush();
+            }
+            db->waitForPendingCompaction();
+            assert(db->lastCompactionError().empty());
+            assert(entriesForKey(*db->currentVersion(), "k") == 1);
+            assert(got(*db, "k") == std::string(100, 'l'));
+        }
+        {
+            auto db = Engine::open(options);
+            assert(got(*db, "k") == std::string(100, 'l'));
+            assert(entriesForKey(*db->currentVersion(), "k") == 1);
+        }
+    }
+
+    // A snapshot before a delete keeps both versions. After it is released,
+    // the next merge can remove the delete and its older value.
+    {
+        const auto dir = caseDir(root, "tombstone-reclamation");
+        const Options options = optionsFor(dir, 64);
+        {
+            auto db = Engine::open(options);
+            db->put("gone", std::string(100, 'v'));
+            db->waitForPendingFlush();
+            auto before_delete = db->snapshot();
+            db->del("gone");
+            for (int i = 0; i < 5; ++i) {
+                db->put(keyFor(i), std::string(100, 'f'));
+                db->waitForPendingFlush();
+            }
+            db->waitForPendingCompaction();
+            assert(db->lastCompactionError().empty());
+            assert(entriesForKey(*db->currentVersion(), "gone") == 2);
+            assert(*db->get("gone", before_delete) == std::string(100, 'v'));
+            before_delete.reset();
+            for (int i = 0; i < 4; ++i) {
+                db->put(keyFor(i), std::string(100, 'n'));
+                db->waitForPendingFlush();
+            }
+            db->waitForPendingCompaction();
+            assert(db->lastCompactionError().empty());
+            assert(entriesForKey(*db->currentVersion(), "gone") == 0);
+            assert(got(*db, "gone") == ".");
+        }
+        {
+            auto db = Engine::open(options);
+            assert(got(*db, "gone") == ".");
         }
     }
 
@@ -334,6 +440,76 @@ int main() {
             for (int i = 0; i < 16; ++i) {
                 assert(got(*db, keyFor(i)) == large_value);
             }
+        }
+    }
+
+    // A shallow tombstone must stay when a deeper table may still contain a
+    // value for that key, even after every snapshot has been released.
+    {
+        const auto dir = caseDir(root, "deeper-tombstone");
+        const Options options = optionsFor(dir, 64);
+        { auto db = Engine::open(options); }
+        {
+            VersionSet versions(dir);
+            versions.recover();
+            const uint64_t number = versions.newFileNumber();
+            SSTableBuilder builder(tableFileName(dir, number));
+            const uint64_t tag = packSeqAndType(1, ValueType::kValue);
+            builder.add("deep", tag, "buried");
+            FileMetaData meta;
+            meta.number = number;
+            meta.file_size = builder.finish();
+            meta.smallest_key = builder.smallestKey();
+            meta.smallest_tag = builder.smallestTag();
+            meta.largest_key = builder.largestKey();
+            meta.largest_tag = builder.largestTag();
+            versions.setLastSequence(1);
+            VersionEdit edit;
+            edit.addFile(2, meta);
+            versions.logAndApply(edit);
+        }
+        {
+            auto db = Engine::open(options);
+            auto before = db->snapshot();
+            db->del("deep");
+            assert(*db->get("deep", before) == "buried");
+            before.reset();
+            for (int i = 0; i < 5; ++i) {
+                db->put(keyFor(i), std::string(100, 'f'));
+                db->waitForPendingFlush();
+            }
+            db->waitForPendingCompaction();
+            assert(db->lastCompactionError().empty());
+            assert(entriesForKey(*db->currentVersion(), "deep", 1) == 1);
+            assert(entriesForKey(*db->currentVersion(), "deep", 2) == 1);
+            assert(got(*db, "deep") == ".");
+        }
+        {
+            auto db = Engine::open(options);
+            assert(got(*db, "deep") == ".");
+        }
+    }
+
+    // A compaction may remove every input entry and publish no output table.
+    {
+        const auto dir = caseDir(root, "empty-compaction");
+        const Options options = optionsFor(dir, 1);
+        {
+            auto db = Engine::open(options);
+            for (char c : { 'a', 'b', 'c' }) {
+                db->put("k", std::string(100, c));
+                db->waitForPendingFlush();
+            }
+            db->del("k");
+            db->waitForPendingCompaction();
+            assert(db->lastFlushError().empty());
+            assert(db->lastCompactionError().empty());
+            assert(db->currentVersion()->numFiles() == 0);
+            assert(got(*db, "k") == ".");
+        }
+        {
+            auto db = Engine::open(options);
+            assert(got(*db, "k") == ".");
         }
     }
 
@@ -415,14 +591,14 @@ int main() {
             for (int i = 0; i < 20; ++i) {
                 db->put(keyFor(i), valueFor(i));
             }
-            after_first = db->snapshot();
+            after_first = db->snapshot().sequence();
             assert(after_first >= 20);
         }
         {
             auto db = Engine::open(optionsFor(dir));
-            assert(db->snapshot() >= after_first);
+            assert(db->snapshot().sequence() >= after_first);
             db->put("newest", "wins");
-            assert(db->snapshot() > after_first);
+            assert(db->snapshot().sequence() > after_first);
             assert(got(*db, "newest") == "wins");
             assert(got(*db, keyFor(0)) == valueFor(0));
         }
@@ -527,18 +703,18 @@ int main() {
     }
 
     // A snapshot captured while writers overwrite one key must keep returning
-    // the same value after flushes, compactions, and restart.
+    // the same value after flushes and compactions.
     {
         const auto dir = caseDir(root, "concurrent-snapshots");
         const Options options = optionsFor(dir, 256);
         auto db = Engine::open(options);
         std::atomic<bool> writing{ true };
-        std::vector<std::pair<uint64_t, std::string>> observed;
+        std::vector<std::pair<Engine::Snapshot, std::string>> observed;
         std::thread sampler([&] {
             while (writing.load() && observed.size() < 1000) {
-                const uint64_t sequence = db->snapshot();
-                const auto value = db->get("shared", sequence);
-                observed.emplace_back(sequence, value.value_or("."));
+                auto snapshot = db->snapshot();
+                const auto value = db->get("shared", snapshot);
+                observed.emplace_back(std::move(snapshot), value.value_or("."));
                 std::this_thread::yield();
             }
         });
@@ -560,15 +736,15 @@ int main() {
         db->waitForPendingCompaction();
         assert(db->lastFlushError().empty());
         assert(db->lastCompactionError().empty());
-        for (const auto& [sequence, value] : observed) {
-            assert(db->get("shared", sequence).value_or(".") == value);
+        for (const auto& [snapshot, value] : observed) {
+            assert(db->get("shared", snapshot).value_or(".") == value);
         }
+        const std::string latest = got(*db, "shared");
         db.reset();
         auto reopened = Engine::open(options);
         reopened->waitForPendingCompaction();
-        for (const auto& [sequence, value] : observed) {
-            assert(reopened->get("shared", sequence).value_or(".") == value);
-        }
+        assert(threw([&] { (void)reopened->get("shared", observed.back().first); }));
+        assert(got(*reopened, "shared") == latest);
     }
 
     std::filesystem::remove_all(root);
