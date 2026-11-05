@@ -197,7 +197,7 @@ size_t SSTable::findBlock(std::string_view key, uint64_t tag) const noexcept {
 }
 
 std::optional<SSTable::Entry> SSTable::get(std::string_view key, uint64_t seq) const {
-    if (_index.empty()) {
+    if (!mayContainUserKey(key) || _index.empty()) {
         return std::nullopt;
     }
     const InternalKeyComparator compare;

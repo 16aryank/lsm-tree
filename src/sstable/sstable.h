@@ -83,6 +83,11 @@ public:
     [[nodiscard]] uint64_t fileSize() const noexcept { return _file_size; }
     [[nodiscard]] size_t numBlocks() const noexcept { return _index.size(); }
     [[nodiscard]] bool hasFilter() const noexcept { return _filter.has_value(); }
+    // A false result is a definite miss. Legacy tables have no filter and
+    // always return true so callers retain the normal lookup path.
+    [[nodiscard]] bool mayContainUserKey(std::string_view key) const noexcept {
+        return !_filter || _filter->mayContain(key);
+    }
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return _path; }
 
     // Key range covered by this table, empty if it has no entries. User keys

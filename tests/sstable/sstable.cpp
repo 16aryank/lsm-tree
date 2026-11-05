@@ -120,6 +120,7 @@ int main() {
         // the middle and last blocks, which only the index can find.
         for (size_t i = 0; i < kKeys; ++i) {
             const std::string key = keyAt(i);
+            assert(table->mayContainUserKey(key));
             auto newest = table->get(key, 100);
             assert(newest.has_value());
             if (key == kDeletedKey) {
@@ -211,6 +212,7 @@ int main() {
         assert(table->numEntries() == 0);
         assert(table->numBlocks() == 0);
         assert(table->hasFilter());
+        assert(!table->mayContainUserKey("anything"));
         assert(table->smallestKey().empty());
         assert(!table->get("anything", 100).has_value());
         assert(!table->cursor().valid());
@@ -288,6 +290,7 @@ int main() {
     {
         const auto legacy = SSTable::open("tests/sstable/fixtures/legacy_v1.sst");
         assert(!legacy->hasFilter());
+        assert(legacy->mayContainUserKey("missing"));
         assert(legacy->numEntries() == 3);
         assert(legacy->get("a", 9)->value == "new");
         assert(legacy->get("a", 1)->value == "old");
@@ -344,6 +347,49 @@ int main() {
 
         // Blocks are verified independently, so the rest of the table is fine.
         assert(table->get(keyAt(0), 100).has_value());
+    }
+
+    // Choose a definite filter miss between stored keys, well past block 0.
+    // Without the filter, the index selects the block containing next_key;
+    // corrupting that block makes the missing lookup's I/O observable.
+    {
+        const auto clean = SSTable::open(path);
+        std::string absent;
+        std::string next_key;
+        for (size_t i = 100; i + 1 < kKeys; ++i) {
+            const std::string candidate = keyAt(i) + std::string("\0", 1);
+            if (!clean->mayContainUserKey(candidate)) {
+                absent = candidate;
+                next_key = keyAt(i + 1);
+                break;
+            }
+        }
+        assert(!absent.empty());
+        assert(absent > clean->smallestKey() && absent < clean->largestKey());
+        assert(!clean->get(absent, 100));
+        assert(clean->get(next_key, 100)->value == "vB-" + next_key);
+
+        const auto damaged = dir / "filter-negative-damaged.sst";
+        std::filesystem::copy_file(path, damaged);
+        corruptByte(damaged, "vB-" + next_key);
+        const auto table = SSTable::open(damaged);
+        assert(!table->mayContainUserKey(absent));
+        assert(!table->get(absent, 100));
+
+        bool checksum_failed = false;
+        try {
+            (void)table->get(next_key, 100);
+        } catch (const std::runtime_error& error) {
+            checksum_failed = std::string_view(error.what()).find("checksum mismatch") !=
+                              std::string_view::npos;
+        }
+        assert(checksum_failed);
+
+        // A tombstone and its older versions remain visible through the
+        // unchanged point-read path, including after a later block is damaged.
+        assert(table->get(kDeletedKey, 100)->type == ValueType::kDelete);
+        assert(table->get(kDeletedKey, 2)->value == "vB-" + kDeletedKey);
+        assert(table->get(kDeletedKey, 1)->value == "vA-" + kDeletedKey);
     }
 
     // Files that aren't tables are rejected at open() rather than misread.

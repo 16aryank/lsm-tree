@@ -248,6 +248,8 @@ int main() {
             }
             db->waitForPendingFlush();
             assert(db->lastFlushError().empty());
+            db->waitForPendingCompaction();
+            assert(db->lastCompactionError().empty());
 
             // One live manifest and one live log, however many flushes ran.
             assert(filesOfType(dir, FileType::kManifest).size() == 1);

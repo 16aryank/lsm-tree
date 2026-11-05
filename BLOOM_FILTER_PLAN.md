@@ -2,7 +2,7 @@
 
 ## Status and goal
 
-Steps 1–2 complete; steps 3–4 remain. Add one file-wide Bloom filter to every newly written SSTable. It covers distinct **user keys**, including keys whose newest entry is a tombstone, independent of sequence number. A filter-negative point lookup must return a miss before reading a data block. False positives may still read a block; false negatives are unacceptable.
+Steps 1–3 complete; step 4 remains. Add one file-wide Bloom filter to every newly written SSTable. It covers distinct **user keys**, including keys whose newest entry is a tombstone, independent of sequence number. A filter-negative point lookup must return a miss before reading a data block. False positives may still read a block; false negatives are unacceptable.
 
 `SSTableBuilder` is shared by memtable flushes, recovery flushes, and compaction outputs, so building the filter there covers all three paths. `Version::get` already delegates candidate files to `SSTable::get`; the lookup check belongs in `SSTable::get`. Existing files use the `LSMSST01` 32-byte footer and have no filter. Opening them must keep working, with the current lookup path as a fallback until compaction rewrites them.
 
@@ -33,6 +33,8 @@ Extend `SSTableBuilder::finish`, the footer format, and `SSTable::open` with the
 **Test gate:** A new multi-block table reopens with exactly one checked filter block and still returns all entries, versions, and tombstones. Empty tables reopen with an empty filter. Corrupt or truncate the filter, its checksum, and its footer handle; open must fail. A frozen `LSMSST01` fixture must still open and answer lookups. A mutation that omits the filter block or ignores its checksum must fail these tests. Run `make test` before step 3.
 
 ## Step 3 — Gate point reads before data-block I/O
+
+**Complete.** `SSTable::get` checks the loaded filter before its index seek and data-block read. A read-only `mayContainUserKey` method reports the same decision; legacy tables return true and keep their existing lookup path. The focused test selects a filter-negative key inside a multi-block table's range, corrupts the data block a normal lookup would read, and proves the miss avoids that checksum error while a present key detects it. Snapshot-sequence reads and tombstones remain correct. Temporarily bypassing the filter check caused the negative lookup to fail on the corrupted block; the check was restored. The focused test and `make test` pass. The DB sweep test now waits for compaction before comparing the settled file set with the current version.
 
 Check the in-memory filter in `SSTable::get` before seeking or reading a data block. Keep the existing index and range checks in `Version::get`; a legacy table without a filter uses its existing behavior. Provide a narrow way for tests to observe the persisted table's filter decision, such as a read-only `mayContainUserKey` method, rather than a general instrumentation system.
 
