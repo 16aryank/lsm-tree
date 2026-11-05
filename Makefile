@@ -65,6 +65,7 @@ SRC_DIRS_version/version           := version/ sstable/ iterator/ wal/ util/ db/
 SRC_DIRS_version/version_set       := version/ sstable/ iterator/ wal/ util/ db/
 SRC_DIRS_iterator/seek             := iterator/ sstable/ memtable/ util/
 SRC_DIRS_db/db                     := db/ version/ memtable/ sstable/ wal/ iterator/ util/
+SRC_DIRS_db/compaction_output      := db/ version/ memtable/ sstable/ wal/ iterator/ util/
 
 define TEST_LINK_RULE
 $(BIN_DIR)/$(1): $(TEST_BUILD)/$(1).o \

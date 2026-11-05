@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -89,6 +90,15 @@ bool threw(auto&& fn) {
         return true;
     }
     return false;
+}
+
+void writeCompactionInputs(Engine& db) {
+    for (int i = 0; i < 4; ++i) {
+        db.put(keyFor(i), valueFor(i));
+        db.waitForPendingFlush();
+        assert(db.lastFlushError().empty());
+    }
+    db.waitForPendingCompaction();
 }
 
 } // namespace
@@ -327,6 +337,87 @@ int main() {
             assert(db->lastCompactionError().empty());
             assert(got(*db, "anchor") == "round-4");
             assert(got(*db, "doomed") == ".");
+        }
+    }
+
+    // An unfinished output and a finished but unpublished output must both
+    // disappear after a compaction abort. The old tables remain readable.
+    for (const auto& [name, fault] : {
+             std::pair{ "output-build-failure", StorageFaultPoint::kCompactionOutputFinish },
+             std::pair{ "uncommitted-output", StorageFaultPoint::kCompactionManifestApply },
+         }) {
+        const auto dir = caseDir(root, name);
+        Options options = optionsFor(dir, 1);
+        std::atomic<bool> saw_finished_output{ false };
+        options.fault_hook = [fault, &dir, &saw_finished_output](StorageFaultPoint point,
+                                                                 const VersionEdit* edit) {
+            if (point == fault) {
+                if (fault == StorageFaultPoint::kCompactionManifestApply) {
+                    assert(edit && !edit->addedFiles().empty());
+                    for (const auto& [level, meta] : edit->addedFiles()) {
+                        (void)level;
+                        assert(std::filesystem::exists(tableFileName(dir, meta.number)));
+                    }
+                    saw_finished_output = true;
+                }
+                throw std::runtime_error("injected compaction failure");
+            }
+        };
+        {
+            auto db = Engine::open(options);
+            writeCompactionInputs(*db);
+            assert(db->lastCompactionError() == "injected compaction failure");
+            assert(db->currentVersion()->files(0).size() == 4);
+            assert(filesOfType(dir, FileType::kTable).size() == 4);
+            if (fault == StorageFaultPoint::kCompactionManifestApply) {
+                assert(saw_finished_output);
+            }
+            for (int i = 0; i < 4; ++i) {
+                assert(got(*db, keyFor(i)) == valueFor(i));
+            }
+        }
+        {
+            auto db = Engine::open(optionsFor(dir, 1));
+            db->waitForPendingCompaction();
+            assert(db->lastCompactionError().empty());
+            for (int i = 0; i < 4; ++i) {
+                assert(got(*db, keyFor(i)) == valueFor(i));
+            }
+        }
+    }
+
+    // A failed manifest sync leaves its complete appended edit ambiguous to
+    // the running process. Keep both input and output files until recovery.
+    {
+        const auto dir = caseDir(root, "manifest-sync-failure");
+        Options options = optionsFor(dir, 1);
+        options.fault_hook = [](StorageFaultPoint point, const VersionEdit* edit) {
+            if (point == StorageFaultPoint::kManifestSync && edit &&
+                !edit->deletedFiles().empty()) {
+                throw std::runtime_error("injected manifest sync failure");
+            }
+        };
+        {
+            auto db = Engine::open(options);
+            writeCompactionInputs(*db);
+            assert(db->lastCompactionError() == "injected manifest sync failure");
+            assert(db->currentVersion()->files(0).size() == 4);
+            assert(filesOfType(dir, FileType::kTable).size() > 4);
+            db->put(keyFor(4), valueFor(4));
+            db->waitForPendingFlush();
+            assert(db->lastFlushError().find("manifest needs recovery") != std::string::npos);
+        }
+        {
+            auto db = Engine::open(optionsFor(dir, 1));
+            db->waitForPendingFlush();
+            db->waitForPendingCompaction();
+            assert(db->lastFlushError().empty());
+            assert(db->lastCompactionError().empty());
+            for (int i = 0; i <= 4; ++i) {
+                assert(got(*db, keyFor(i)) == valueFor(i));
+            }
+            assert(filesOfType(dir, FileType::kTable).size() ==
+                   db->currentVersion()->numFiles());
         }
     }
 

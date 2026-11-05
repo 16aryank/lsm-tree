@@ -248,7 +248,7 @@ private:
     }
     explicit DB(Options options)
         : _options(std::move(options)),
-          _versions(_options.dir, _options.max_manifest_file_size) { }
+          _versions(_options.dir, _options.max_manifest_file_size, _options.fault_hook) { }
 
     // ── startup ───────────────────────────────────────────────────────────────
 
@@ -623,6 +623,9 @@ private:
         const auto finishOutput = [&] {
             FileMetaData meta;
             meta.number = active_number;
+            if (_options.fault_hook) {
+                _options.fault_hook(StorageFaultPoint::kCompactionOutputFinish, nullptr);
+            }
             meta.file_size = builder->finish();
             meta.smallest_key = builder->smallestKey();
             meta.smallest_tag = builder->smallestTag();
@@ -694,6 +697,9 @@ private:
                 std::lock_guard<std::mutex> guard(_manifest_mutex);
                 if (!planStillCurrent(plan)) {
                     throw std::runtime_error("compaction inputs changed before commit");
+                }
+                if (_options.fault_hook) {
+                    _options.fault_hook(StorageFaultPoint::kCompactionManifestApply, &edit);
                 }
                 _versions.logAndApply(edit);
                 committed = true;

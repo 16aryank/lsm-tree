@@ -38,8 +38,10 @@ std::string_view trim(std::string_view text) {
 
 } // namespace
 
-VersionSet::VersionSet(std::filesystem::path dir, uint64_t max_manifest_file_size)
-    : _dir(std::move(dir)), _max_manifest_file_size(max_manifest_file_size) { }
+VersionSet::VersionSet(std::filesystem::path dir, uint64_t max_manifest_file_size,
+                       StorageFaultHook fault_hook)
+    : _dir(std::move(dir)), _max_manifest_file_size(max_manifest_file_size),
+      _fault_hook(std::move(fault_hook)) { }
 
 VersionSet::~VersionSet() {
     closeManifest();
@@ -257,6 +259,9 @@ void VersionSet::logAndApply(VersionEdit& edit) {
         const std::string record = edit.encode();
         try {
             _manifest_log->addRecord(byteSpan(record));
+            if (_fault_hook) {
+                _fault_hook(StorageFaultPoint::kManifestSync, &edit);
+            }
             // Durable before the version is installed.
             _manifest_log->sync();
         } catch (...) {

@@ -2,7 +2,7 @@
 
 ## Status
 
-Steps 0–6 are implemented. The picker, background worker, bounded retries, output splitting, pending-file protection, manifest failure guard, worker metrics, registered snapshots, and reclamation rules are in place. Tests cover level-0 and level-1 selection, level-0-to-1 and level-1-to-2 compaction, snapshots across compactions, snapshot release, both tombstone rules, restart, and an older pinned `Version` through cleanup. Fault-injection tests for output and manifest I/O failures remain open.
+Steps 0–6 are implemented. The picker, background worker, bounded retries, output splitting, pending-file protection, manifest failure guard, worker metrics, registered snapshots, and reclamation rules are in place. Tests cover level-0 and level-1 selection, level-0-to-1 and level-1-to-2 compaction, snapshots across compactions, snapshot release, both tombstone rules, restart, and an older pinned `Version` through cleanup. Fault hooks cover an unfinished output, a finished but unpublished output, and a manifest sync failure after its edit was appended. Direct output-merge tests cover exact-key tie priority, tombstones, multiple versions, output splitting, an oversized single key, and byte-for-byte reads across rewriting.
 
 ## Goal and current starting point
 

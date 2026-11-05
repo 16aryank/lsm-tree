@@ -29,4 +29,7 @@ struct Options {
 
     // Refuse to open a directory that already holds a database.
     bool error_if_exists = false;
+
+    // Optional fault hook for deterministic storage failure tests.
+    StorageFaultHook fault_hook;
 };

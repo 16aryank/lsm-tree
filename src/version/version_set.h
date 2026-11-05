@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <set>
 #include <string>
@@ -15,6 +16,16 @@
 // Threshold for rolling the manifest to a file-set snapshot.
 inline constexpr uint64_t kDefaultMaxManifestFileSize = 64ull << 20;
 
+enum class StorageFaultPoint {
+    kCompactionOutputFinish,
+    kCompactionManifestApply,
+    kManifestSync,
+};
+
+// Tests may throw at a storage boundary. The edit is present only for manifest
+// callbacks and remains owned by the caller.
+using StorageFaultHook = std::function<void(StorageFaultPoint, const VersionEdit*)>;
+
 // Owns the current immutable file set and its manifest. Manifest payloads are
 // VersionEdits in WAL framing. Commits build a Version, sync its edit, then
 // publish it. createNew(), recover(), and logAndApply() require one writer;
@@ -22,7 +33,8 @@ inline constexpr uint64_t kDefaultMaxManifestFileSize = 64ull << 20;
 class VersionSet {
 public:
     explicit VersionSet(std::filesystem::path dir,
-                        uint64_t max_manifest_file_size = kDefaultMaxManifestFileSize);
+                        uint64_t max_manifest_file_size = kDefaultMaxManifestFileSize,
+                        StorageFaultHook fault_hook = {});
     ~VersionSet();
 
     VersionSet(const VersionSet&)            = delete;
@@ -86,6 +98,7 @@ private:
 
     std::filesystem::path _dir;
     uint64_t              _max_manifest_file_size;
+    StorageFaultHook      _fault_hook;
 
     std::atomic<uint64_t> _next_file_number{ 1 };
     std::atomic<uint64_t> _last_sequence{ 0 };
