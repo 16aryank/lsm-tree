@@ -2,7 +2,7 @@
 
 ## Status and goal
 
-Planned; no implementation steps are complete. Add one file-wide Bloom filter to every newly written SSTable. It covers distinct **user keys**, including keys whose newest entry is a tombstone, independent of sequence number. A filter-negative point lookup must return a miss before reading a data block. False positives may still read a block; false negatives are unacceptable.
+Step 1 complete; steps 2–4 remain. Add one file-wide Bloom filter to every newly written SSTable. It covers distinct **user keys**, including keys whose newest entry is a tombstone, independent of sequence number. A filter-negative point lookup must return a miss before reading a data block. False positives may still read a block; false negatives are unacceptable.
 
 `SSTableBuilder` is shared by memtable flushes, recovery flushes, and compaction outputs, so building the filter there covers all three paths. `Version::get` already delegates candidate files to `SSTable::get`; the lookup check belongs in `SSTable::get`. Existing files use the `LSMSST01` 32-byte footer and have no filter. Opening them must keep working, with the current lookup path as a fallback until compaction rewrites them.
 
@@ -17,6 +17,8 @@ The persisted filter and index are read once when a table opens. “Before any b
 - Keep a loaded filter per `SSTable` instance. Check it at the start of `SSTable::get`, before `findBlock` and `readBlock`. Iterators still read actual entries and never use the filter. A filter match is only permission to continue the normal lookup; it is not proof that a key or snapshot-visible version exists.
 
 ## Step 1 — Implement and prove the filter primitive
+
+**Complete.** `src/sstable/bloom_filter.{h,cpp}` implements a versioned payload, deterministic seeded hashes, adjacent user-key deduplication, and bounded decode/build. `tests/sstable/bloom_filter.cpp` covers this step. The focused test and `make test` pass. Shifting the double-hash probe position by one temporarily caused the fixed encoding assertion to fail; the correct expression was restored and the focused test passed again. The fixed probe set produced 84 false positives in 10,000 absent keys.
 
 Add a small filter encoder/decoder and deterministic two-hash implementation in `src/sstable`, with no general-purpose filtering framework. Specify the payload version, bit count, probe count, and bit array in the format code.
 

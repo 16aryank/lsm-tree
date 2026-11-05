@@ -57,6 +57,7 @@ $(TEST_BUILD)/%.o: $(TEST_DIR)/%.cpp
 # Link each test with its matching source directory and any listed dependencies.
 SRC_DIRS_wal/wal                   := wal/ util/
 SRC_DIRS_sstable/sstable           := sstable/ util/
+SRC_DIRS_sstable/bloom_filter      := sstable/ util/
 SRC_DIRS_memtable/memtable_manager := memtable/ wal/ util/
 SRC_DIRS_iterator/merging_iterator := iterator/ sstable/ memtable/ util/
 # Version tests share the same source dependencies.
