@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cerrno>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <fcntl.h>
@@ -31,6 +32,9 @@ void SSTableBuilder::writeAll(const void* buf, size_t n) {
 }
 
 void SSTableBuilder::writeBlock(const std::string& contents, BlockHandle& handle) {
+    if (contents.size() > UINT32_MAX) {
+        throw std::length_error("SSTable block exceeds uint32 size limit");
+    }
     handle.offset = _offset;
     handle.size = static_cast<uint32_t>(contents.size());
 
@@ -64,6 +68,7 @@ void SSTableBuilder::add(std::string_view key, uint64_t tag, std::string_view va
     assert(_num_entries == 0 ||
            InternalKeyComparator{}(_last_key, _last_tag, key, tag) < 0);
 
+    _filter_builder.addUserKey(key);
     appendEntry(_block, key, tag, value);
     if (_num_entries == 0) {
         _first_key.assign(key);
@@ -84,11 +89,15 @@ uint64_t SSTableBuilder::finish() {
     assert(!_finished);
     flushDataBlock();
 
+    BlockHandle filter_handle;
+    const std::string filter_payload = _filter_builder.finish().encode();
+    writeBlock(filter_payload, filter_handle);
+
     BlockHandle index_handle;
     writeBlock(_index, index_handle);
 
     std::string footer;
-    appendFooter(footer, { index_handle.offset, index_handle.size, _num_entries });
+    appendFooterV2(footer, { filter_handle, index_handle, _num_entries });
     writeAll(footer.data(), footer.size());
 
     fileutil::syncFile(_fd, "SSTable sync: " + _path.string());

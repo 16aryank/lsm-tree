@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -15,6 +16,11 @@ namespace {
 
 [[noreturn]] void corrupt(const std::filesystem::path& path, const std::string& what) {
     throw std::runtime_error("SSTable " + path.string() + ": " + what);
+}
+
+bool blockEndsAt(const BlockHandle& handle, uint64_t end) noexcept {
+    return handle.offset <= end &&
+           static_cast<uint64_t>(handle.size) + kBlockTrailerSize == end - handle.offset;
 }
 
 } // namespace
@@ -52,6 +58,10 @@ void SSTable::readAll(void* buf, size_t n, uint64_t offset) const {
 }
 
 std::string SSTable::readBlock(const BlockHandle& handle) const {
+    if (static_cast<uint64_t>(handle.size) + kBlockTrailerSize >
+        std::numeric_limits<size_t>::max()) {
+        corrupt(_path, "block too large to read");
+    }
     std::string buffer(static_cast<size_t>(handle.size) + kBlockTrailerSize, '\0');
     readAll(buffer.data(), buffer.size(), handle.offset);
 
@@ -69,34 +79,71 @@ void SSTable::loadIndex() {
         throw std::system_error(errno, std::generic_category(),
                                 "SSTable fstat: " + _path.string());
     }
+    if (st.st_size < 0) {
+        corrupt(_path, "negative file size");
+    }
     _file_size = static_cast<uint64_t>(st.st_size);
 
-    // Smallest legal file: an empty index block, its trailer, and the footer.
-    if (_file_size < kFooterSize + kBlockTrailerSize) {
+    if (_file_size < sizeof(uint64_t)) {
         corrupt(_path, "file too small to be an SSTable");
     }
 
-    char footer_bytes[kFooterSize];
-    readAll(footer_bytes, kFooterSize, _file_size - kFooterSize);
-
-    SSTableFooter footer;
-    if (!decodeFooter({ footer_bytes, kFooterSize }, footer)) {
-        // Also what a build that died before writing its footer looks like.
+    char magic_bytes[sizeof(uint64_t)];
+    readAll(magic_bytes, sizeof(magic_bytes), _file_size - sizeof(magic_bytes));
+    const uint64_t magic = decodeFixed64(magic_bytes);
+    if (magic != kSSTableMagic && magic != kSSTableMagicV2) {
         corrupt(_path, "bad magic number in footer");
     }
-
-    // The index block must sit immediately before the footer, and the data
-    // blocks entirely before the index.
-    if (footer.index_offset > _file_size || footer.index_size > _file_size ||
-        footer.index_offset + footer.index_size + kBlockTrailerSize != _file_size - kFooterSize) {
-        corrupt(_path, "index block does not fit the file");
+    const size_t footer_size = magic == kSSTableMagicV2 ? kFooterV2Size : kFooterSize;
+    if (_file_size < footer_size + kBlockTrailerSize) {
+        corrupt(_path, "file too small to be an SSTable");
     }
-    _num_entries = footer.num_entries;
+    const uint64_t footer_start = _file_size - footer_size;
+    char footer_bytes[kFooterV2Size];
+    readAll(footer_bytes, footer_size, footer_start);
 
-    const std::string index_block =
-        readBlock({ footer.index_offset, static_cast<uint32_t>(footer.index_size) });
+    BlockHandle index_handle;
+    uint64_t data_end = 0;
+    if (magic == kSSTableMagicV2) {
+        SSTableFooterV2 footer;
+        if (!decodeFooterV2({ footer_bytes, footer_size }, footer)) {
+            corrupt(_path, "malformed v2 footer");
+        }
+        if (!blockEndsAt(footer.index, footer_start) ||
+            !blockEndsAt(footer.filter, footer.index.offset) ||
+            footer.filter.size < kBloomHeaderSize) {
+            corrupt(_path, "filter or index block outside its region");
+        }
+        data_end = footer.filter.offset;
+        index_handle = footer.index;
+        _num_entries = footer.num_entries;
+
+        const std::string filter_payload = readBlock(footer.filter);
+        _filter = BloomFilter::decode(filter_payload);
+        if (!_filter) {
+            corrupt(_path, "malformed Bloom filter payload");
+        }
+        if ((_num_entries == 0) != (_filter->bitCount() == 0)) {
+            corrupt(_path, "filter emptiness disagrees with entry count");
+        }
+    } else {
+        SSTableFooter footer;
+        if (!decodeFooter({ footer_bytes, footer_size }, footer) ||
+            footer.index_size > UINT32_MAX) {
+            corrupt(_path, "malformed legacy footer");
+        }
+        index_handle = { footer.index_offset, static_cast<uint32_t>(footer.index_size) };
+        if (!blockEndsAt(index_handle, footer_start)) {
+            corrupt(_path, "index block does not fit the file");
+        }
+        data_end = index_handle.offset;
+        _num_entries = footer.num_entries;
+    }
+
+    const std::string index_block = readBlock(index_handle);
 
     size_t           offset = 0;
+    uint64_t         next_data_offset = 0;
     SSTableEntryView entry;
     while (offset < index_block.size()) {
         const size_t next = decodeEntry(index_block, offset, entry);
@@ -107,13 +154,21 @@ void SSTable::loadIndex() {
         if (!decodeBlockHandle(entry.value, handle)) {
             corrupt(_path, "malformed block handle in index");
         }
-        // A handle pointing at (or past) the index would let a lookup read
-        // the wrong region entirely, so bound it against the data area.
-        if (handle.offset + handle.size + kBlockTrailerSize > footer.index_offset) {
-            corrupt(_path, "data block outside the data region");
+        // Builder output has consecutive data blocks from byte zero through
+        // the filter (v2) or index (legacy), with no overlap or hidden gap.
+        if (handle.offset != next_data_offset || handle.offset > data_end ||
+            static_cast<uint64_t>(handle.size) + kBlockTrailerSize >
+                data_end - handle.offset) {
+            corrupt(_path, "data block outside the data region or out of order");
         }
+        next_data_offset = handle.offset + static_cast<uint64_t>(handle.size) +
+                           kBlockTrailerSize;
         _index.push_back({ std::string(entry.key), entry.tag, handle });
         offset = next;
+    }
+
+    if (next_data_offset != data_end || (_index.empty() != (_num_entries == 0))) {
+        corrupt(_path, "data region does not match index and entry count");
     }
 
     if (_index.empty()) {

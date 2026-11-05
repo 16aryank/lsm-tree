@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -67,6 +68,29 @@ void corruptByte(const std::filesystem::path& path, const std::string& marker) {
     out.write(&flipped, 1);
 }
 
+std::string readFile(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    assert(in);
+    return { std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>() };
+}
+
+void writeFile(const std::filesystem::path& path, std::string_view bytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    assert(out);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    assert(out);
+}
+
+void rejectsOpen(const std::filesystem::path& path) {
+    bool threw = false;
+    try {
+        (void)SSTable::open(path);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    assert(threw);
+}
+
 } // namespace
 
 int main() {
@@ -82,6 +106,7 @@ int main() {
         assert(table->numEntries() == kKeys * 2 + 1);
         // The point of the block size chosen above.
         assert(table->numBlocks() > 1);
+        assert(table->hasFilter());
         assert(table->smallestKey() == keyAt(0));
         assert(table->largestKey() == keyAt(kKeys - 1));
 
@@ -175,18 +200,106 @@ int main() {
         std::filesystem::remove(path);
     }
 
-    // An empty table is still a valid file: a footer, and nothing to find.
+    // An empty table has an empty filter block and index block.
     {
         const std::filesystem::path empty_path = dir / "empty.sst";
         SSTableBuilder builder(empty_path);
-        assert(builder.finish() == kFooterSize + kBlockTrailerSize);
+        assert(builder.finish() == kFooterV2Size + 2 * kBlockTrailerSize +
+                                   kBloomHeaderSize);
 
         auto table = SSTable::open(empty_path);
         assert(table->numEntries() == 0);
         assert(table->numBlocks() == 0);
+        assert(table->hasFilter());
         assert(table->smallestKey().empty());
         assert(!table->get("anything", 100).has_value());
         assert(!table->cursor().valid());
+    }
+
+    // The v2 footer describes exactly one filter block between data and the
+    // index. Opening checks its checksum and payload before keeping it.
+    {
+        const std::string bytes = readFile(path);
+        SSTableFooterV2 footer;
+        assert(decodeFooterV2(std::string_view(bytes).substr(bytes.size() - kFooterV2Size),
+                              footer));
+        assert(footer.num_entries == kKeys * 2 + 1);
+        assert(footer.filter.offset > 0);
+        assert(footer.filter.size >= kBloomHeaderSize);
+        assert(footer.filter.offset + footer.filter.size + kBlockTrailerSize ==
+               footer.index.offset);
+        assert(footer.index.offset + footer.index.size + kBlockTrailerSize ==
+               bytes.size() - kFooterV2Size);
+        const std::string_view payload(bytes.data() + footer.filter.offset,
+                                       footer.filter.size);
+        assert(blockChecksum(payload) ==
+               decodeFixed32(bytes.data() + footer.filter.offset + footer.filter.size));
+        const auto decoded = BloomFilter::decode(payload);
+        assert(decoded && decoded->bitCount() == 2000 && decoded->probeCount() == 7);
+        for (size_t i = 0; i < kKeys; ++i) {
+            assert(decoded->mayContain(keyAt(i)));
+        }
+
+        std::string damaged = bytes;
+        damaged[footer.filter.offset] = 2;
+        const uint32_t checksum = blockChecksum(
+            std::string_view(damaged).substr(footer.filter.offset, footer.filter.size));
+        std::string checksum_bytes;
+        putFixed32(checksum_bytes, checksum);
+        damaged.replace(footer.filter.offset + footer.filter.size, 4, checksum_bytes);
+        writeFile(dir / "filter-malformed.sst", damaged);
+        rejectsOpen(dir / "filter-malformed.sst");
+
+        damaged = bytes;
+        damaged[footer.filter.offset + footer.filter.size] ^= 0x01;
+        writeFile(dir / "filter-checksum.sst", damaged);
+        rejectsOpen(dir / "filter-checksum.sst");
+
+        damaged = bytes;
+        damaged.resize(footer.filter.offset + footer.filter.size / 2);
+        writeFile(dir / "filter-truncated.sst", damaged);
+        rejectsOpen(dir / "filter-truncated.sst");
+
+        damaged = bytes;
+        // Shift the filter's footer offset into the data region. The reader
+        // must reject the overlap before reading any block through it.
+        const size_t footer_at = damaged.size() - kFooterV2Size;
+        damaged[footer_at] ^= 0x01;
+        writeFile(dir / "filter-handle.sst", damaged);
+        rejectsOpen(dir / "filter-handle.sst");
+
+        damaged = bytes;
+        std::string huge_offset;
+        putFixed64(huge_offset, UINT64_MAX);
+        damaged.replace(footer_at, 8, huge_offset);
+        writeFile(dir / "filter-overflow.sst", damaged);
+        rejectsOpen(dir / "filter-overflow.sst");
+
+        damaged = bytes;
+        std::string huge_size;
+        putFixed32(huge_size, UINT32_MAX);
+        damaged.replace(footer_at + kBlockHandleSize + 8, 4, huge_size);
+        writeFile(dir / "index-overflow.sst", damaged);
+        rejectsOpen(dir / "index-overflow.sst");
+    }
+
+    // Frozen LSMSST01 bytes were made before the new builder existed. They
+    // exercise the old footer decoder without invoking today's writer.
+    {
+        const auto legacy = SSTable::open("tests/sstable/fixtures/legacy_v1.sst");
+        assert(!legacy->hasFilter());
+        assert(legacy->numEntries() == 3);
+        assert(legacy->get("a", 9)->value == "new");
+        assert(legacy->get("a", 1)->value == "old");
+        assert(legacy->get("z", 9)->type == ValueType::kDelete);
+        assert(!legacy->get("missing", 9));
+
+        std::string bad_legacy = readFile("tests/sstable/fixtures/legacy_v1.sst");
+        std::string oversized;
+        putFixed64(oversized, static_cast<uint64_t>(UINT32_MAX) + 1);
+        bad_legacy.replace(bad_legacy.size() - kFooterSize + 8, 8, oversized);
+        writeFile(dir / "legacy-oversized-index.sst", bad_legacy);
+        rejectsOpen(dir / "legacy-oversized-index.sst");
     }
 
     // abandon() leaves nothing behind, which is what a failed flush relies on.

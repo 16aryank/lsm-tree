@@ -15,10 +15,13 @@
 //     | data block 1        |
 //     | ...                 |
 //     +---------------------+
+//     | filter block        |  versioned Bloom payload, + CRC trailer (v2)
 //     | index block         |  one entry per data block, + CRC trailer
 //     +---------------------+
-//     | footer (32 bytes)   |  where the index lives, how many entries, magic
+//     | footer              |  block handles, entry count, and format magic
 //     +---------------------+
+// LSMSST01 files have no filter block and use a 32-byte footer. LSMSST02
+// files have a 40-byte footer.
 //
 
 // Bytes of entry data the builder packs into a data block before starting a
@@ -37,13 +40,16 @@ inline constexpr size_t kEntryHeaderSize = 16;
 // only and excludes the trailer.
 inline constexpr size_t kBlockHandleSize = 12;
 
-// Footer: index_offset uint64 | index_size uint64 | num_entries uint64 | magic
-// uint64. Fixed width and last in the file, so a reader starts by seeking to
-// (file_size - kFooterSize) and works backwards.
+// Legacy footer: index_offset uint64 | index_size uint64 | num_entries uint64
+// | magic uint64. New footer: filter handle (12 bytes) | index handle
+// (12 bytes) | num_entries uint64 | magic uint64. The final magic selects the
+// footer length before any offsets are trusted.
 inline constexpr size_t kFooterSize = 32;
+inline constexpr size_t kFooterV2Size = 40;
 
 // "LSMSST01" in ASCII. Identifies the file and pins the format version.
 inline constexpr uint64_t kSSTableMagic = 0x4c534d5353543031ULL;
+inline constexpr uint64_t kSSTableMagicV2 = 0x4c534d5353543032ULL;
 
 
 [[nodiscard]] inline uint32_t blockChecksum(std::string_view contents) noexcept {
@@ -129,6 +135,12 @@ struct SSTableFooter {
     uint64_t num_entries  = 0;
 };
 
+struct SSTableFooterV2 {
+    BlockHandle filter;
+    BlockHandle index;
+    uint64_t num_entries = 0;
+};
+
 inline void appendFooter(std::string& dst, const SSTableFooter& footer) {
     putFixed64(dst, footer.index_offset);
     putFixed64(dst, footer.index_size);
@@ -148,5 +160,24 @@ inline void appendFooter(std::string& dst, const SSTableFooter& footer) {
     out.index_offset = decodeFixed64(src.data());
     out.index_size   = decodeFixed64(src.data() + 8);
     out.num_entries  = decodeFixed64(src.data() + 16);
+    return true;
+}
+
+inline void appendFooterV2(std::string& dst, const SSTableFooterV2& footer) {
+    appendBlockHandle(dst, footer.filter);
+    appendBlockHandle(dst, footer.index);
+    putFixed64(dst, footer.num_entries);
+    putFixed64(dst, kSSTableMagicV2);
+}
+
+[[nodiscard]] inline bool decodeFooterV2(std::string_view src, SSTableFooterV2& out) noexcept {
+    if (src.size() != kFooterV2Size || decodeFixed64(src.data() + 32) != kSSTableMagicV2) {
+        return false;
+    }
+    if (!decodeBlockHandle(src.substr(0, kBlockHandleSize), out.filter) ||
+        !decodeBlockHandle(src.substr(kBlockHandleSize, kBlockHandleSize), out.index)) {
+        return false;
+    }
+    out.num_entries = decodeFixed64(src.data() + 24);
     return true;
 }

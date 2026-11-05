@@ -2,7 +2,7 @@
 
 ## Status and goal
 
-Step 1 complete; steps 2–4 remain. Add one file-wide Bloom filter to every newly written SSTable. It covers distinct **user keys**, including keys whose newest entry is a tombstone, independent of sequence number. A filter-negative point lookup must return a miss before reading a data block. False positives may still read a block; false negatives are unacceptable.
+Steps 1–2 complete; steps 3–4 remain. Add one file-wide Bloom filter to every newly written SSTable. It covers distinct **user keys**, including keys whose newest entry is a tombstone, independent of sequence number. A filter-negative point lookup must return a miss before reading a data block. False positives may still read a block; false negatives are unacceptable.
 
 `SSTableBuilder` is shared by memtable flushes, recovery flushes, and compaction outputs, so building the filter there covers all three paths. `Version::get` already delegates candidate files to `SSTable::get`; the lookup check belongs in `SSTable::get`. Existing files use the `LSMSST01` 32-byte footer and have no filter. Opening them must keep working, with the current lookup path as a fallback until compaction rewrites them.
 
@@ -25,6 +25,8 @@ Add a small filter encoder/decoder and deterministic two-hash implementation in 
 **Test gate:** Focused tests cover empty and tiny filters, duplicate user keys, embedded NUL and high-byte keys, deterministic encoding across repeated builds, round-trip decoding, malformed payload rejection, and zero false negatives for a substantial fixed key set. Include a deterministic disjoint probe set and count false positives. A temporary change to the hash step or bit access must break a focused test. Run `make test` before step 2.
 
 ## Step 2 — Persist and load one filter per new SSTable
+
+**Complete.** New tables write a checked filter block and `LSMSST02` footer; opening loads and validates the filter, index, and nonoverlapping data region. The frozen `LSMSST01` fixture still opens. The SSTable test covers multi-block reads, empty tables, malformed and truncated filters, checksum and handle corruption, and oversized offsets. The focused test and `make test` pass. Temporarily omitting the filter block or ignoring block checksums broke the focused test; both changes were restored.
 
 Extend `SSTableBuilder::finish`, the footer format, and `SSTable::open` with the new filter block. Preserve `LSMSST01` reading. Validate offset arithmetic before narrowing any stored sizes to `size_t` or `uint32_t`, and reject overlap between data, filter, index, and footer. Existing metadata and iterator behavior must stay intact.
 

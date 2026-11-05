@@ -9,10 +9,11 @@
 #include <vector>
 
 #include "key.h"
+#include "sstable/bloom_filter.h"
 #include "sstable/sstable_format.h"
 
-// Immutable sorted table. The index stays in memory; checked data blocks are
-// read on demand. pread() permits concurrent readers on one table.
+// Immutable sorted table. The index and optional filter stay in memory;
+// checked data blocks are read on demand. pread() permits concurrent readers.
 class SSTable {
 public:
     // A kDelete entry masks older versions in other tables.
@@ -81,6 +82,7 @@ public:
     [[nodiscard]] uint64_t numEntries() const noexcept { return _num_entries; }
     [[nodiscard]] uint64_t fileSize() const noexcept { return _file_size; }
     [[nodiscard]] size_t numBlocks() const noexcept { return _index.size(); }
+    [[nodiscard]] bool hasFilter() const noexcept { return _filter.has_value(); }
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return _path; }
 
     // Key range covered by this table, empty if it has no entries. User keys
@@ -106,8 +108,8 @@ private:
     // First block whose last internal key is at or after (key, tag).
     [[nodiscard]] size_t findBlock(std::string_view key, uint64_t tag) const noexcept;
 
-    // Reads the footer and index block, then the first data block to learn the
-    // smallest key. Throws on anything malformed.
+    // Reads the footer, optional filter, and index block, then the first data
+    // block to learn the smallest key. Throws on anything malformed.
     void loadIndex();
 
     // Reads a block, checks its CRC, and returns its contents without the
@@ -123,6 +125,7 @@ private:
     uint64_t                _file_size   = 0;
     uint64_t                _num_entries = 0;
     std::vector<IndexEntry> _index;
+    std::optional<BloomFilter> _filter;
     std::string             _smallest_key;
     std::string             _largest_key;
     uint64_t                _smallest_tag = 0;

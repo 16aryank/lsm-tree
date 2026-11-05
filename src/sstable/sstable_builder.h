@@ -1,9 +1,11 @@
 #pragma once
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
 
+#include "sstable/bloom_filter.h"
 #include "sstable/sstable_format.h"
 
 // Writes sorted entries in one pass. finish() writes the footer last and syncs
@@ -23,7 +25,7 @@ public:
     // internal-key order; violating that asserts.
     void add(std::string_view key, uint64_t tag, std::string_view value);
 
-    // Flushes the last data block, then the index and footer, and fsyncs both
+    // Flushes the last data block, filter, index, and footer, then syncs both
     // the file and its directory so the table survives a crash. Returns the
     // file size in bytes. Throws std::system_error on I/O failure.
     uint64_t finish();
@@ -34,9 +36,23 @@ public:
 
     [[nodiscard]] inline uint64_t numEntries() const noexcept { return _num_entries; }
 
-    // Bytes written plus the current data block.
+    // Bytes written, the current data block, and the pending filter block.
+    // Saturates if an unfinished table grows beyond the representable range.
     [[nodiscard]] inline uint64_t estimatedSize() const noexcept {
-        return _offset + _block.size();
+        if (_offset > UINT64_MAX - _block.size()) {
+            return UINT64_MAX;
+        }
+        const uint64_t base = _offset + _block.size();
+        if (_num_entries == 0) {
+            return base;
+        }
+        const uint64_t keys = _filter_builder.distinctKeys();
+        if (keys > (UINT64_MAX - 7) / 10) {
+            return UINT64_MAX;
+        }
+        const uint64_t filter_bytes = std::max<uint64_t>(8, (keys * 10 + 7) / 8);
+        const uint64_t pending = kBloomHeaderSize + filter_bytes + kBlockTrailerSize;
+        return base > UINT64_MAX - pending ? UINT64_MAX : base + pending;
     }
     [[nodiscard]] inline const std::filesystem::path& path() const noexcept { return _path; }
 
@@ -65,6 +81,7 @@ private:
 
     std::string _block; // data block under construction
     std::string _index; // index block, one entry per finished data block
+    BloomFilterBuilder _filter_builder;
 
     // First key added. Entries arrive in internal-key order, so this is the
     // table's lower bound.
